@@ -1,0 +1,6 @@
+{
+  "name": "Advanced Domain Inspector",
+  "description": "Professional domain checking dashboard for independent SSL certificate verification, website availability detection, and WHOIS/RDAP registration analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
