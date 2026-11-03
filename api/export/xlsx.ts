@@ -1,13 +1,11 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { jobManager } from '../../server/jobManager.js';
+import { exportToExcel } from '../../server/jobManager.js';
+import type { DomainItem } from '../../server/types.js';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
   try {
-    const buffer = await jobManager.exportToExcel();
+    const items: DomainItem[] = req.body?.items || [];
+    const buffer = exportToExcel(items);
     const filename = `domain-inspector-${new Date().toISOString().split('T')[0]}.xlsx`;
     res.setHeader(
       'Content-Type',

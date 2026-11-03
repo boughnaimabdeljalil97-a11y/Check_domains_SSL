@@ -1,4 +1,3 @@
-import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import * as XLSX from 'xlsx';
 import type {
@@ -6,485 +5,444 @@ import type {
   InspectionState,
   InspectionStats,
   CheckerSettings,
-  DomainLog
+  DomainLog,
+  WhoisResult
 } from './types.js';
 import { checkDomainSSL } from './sslChecker.js';
 import { checkDomainWebsite } from './websiteChecker.js';
 import { checkDomainWhois } from './whoisChecker.js';
-import {
-  jobStore,
-  getState,
-  setState,
-  setItem,
-  DEFAULT_SETTINGS,
-  DEFAULT_STATE,
-  calculateStats
-} from './jobStore.js';
 
-export class JobManager extends EventEmitter {
-  private isProcessing = false;
+export const DEFAULT_SETTINGS: CheckerSettings = {
+  workers: 4,
+  timeoutSeconds: 30,
+  maxRetries: 2,
+  enableSSL: true,
+  enableWebsite: true,
+  enableWhois: true,
+  whoisPacedDelayMs: 800
+};
 
-  constructor() {
-    super();
+export const DEFAULT_STATE: InspectionState = {
+  status: 'idle',
+  items: [],
+  settings: DEFAULT_SETTINGS,
+  stats: {
+    total: 0,
+    completed: 0,
+    pending: 0,
+    inFlight: 0,
+    retryRequired: 0,
+    sslYes: 0,
+    sslNo: 0,
+    websiteYes: 0,
+    websiteNo: 0,
+    bothYes: 0,
+    whoisFound: 0,
+    percentComplete: 0
+  },
+  activeWorkers: 0,
+  currentWorkerAssignments: {},
+  startedAt: null,
+  updatedAt: new Date().toISOString()
+};
+
+export function calculateStats(items: DomainItem[]): InspectionStats {
+  let completed = 0;
+  let pending = 0;
+  let inFlight = 0;
+  let retryRequired = 0;
+  let sslYes = 0;
+  let sslNo = 0;
+  let websiteYes = 0;
+  let websiteNo = 0;
+  let bothYes = 0;
+  let whoisFound = 0;
+
+  for (const item of items) {
+    if (item.status === 'completed') completed++;
+    else if (item.status === 'pending') pending++;
+    else if (item.status === 'checking') inFlight++;
+    else if (item.status === 'retry_required') retryRequired++;
+
+    if (item.ssl.status === 'YES') sslYes++;
+    else if (item.ssl.status === 'NO') sslNo++;
+
+    if (item.website.status === 'YES') websiteYes++;
+    else if (item.website.status === 'NO') websiteNo++;
+
+    if (item.ssl.status === 'YES' && item.website.status === 'YES') {
+      bothYes++;
+    }
+
+    if (item.whois.status === 'FOUND') {
+      whoisFound++;
+    }
   }
 
-  public async getFullState(_jobId: string = 'current'): Promise<InspectionState> {
-    return getState();
+  const total = items.length;
+  const percentComplete = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+  return {
+    total,
+    completed,
+    pending,
+    inFlight,
+    retryRequired,
+    sslYes,
+    sslNo,
+    websiteYes,
+    websiteNo,
+    bothYes,
+    whoisFound,
+    percentComplete
+  };
+}
+
+export function normalizeDomain(raw: string): string | null {
+  if (!raw) return null;
+  let s = raw.trim();
+
+  s = s.replace(/^["']|["']$/g, '').trim();
+  s = s.replace(/^(?:https?:\/\/)/i, '');
+  s = s.split('/')[0].split('?')[0].split('#')[0];
+  s = s.split(':')[0];
+  s = s.toLowerCase().trim();
+
+  if (!s || s.includes(' ') || s.includes('@')) {
+    return null;
   }
 
-  public getFullStateSync(): InspectionState {
-    return globalThis.__DOMAIN_INSPECTION_MEMORY_STATE__ || DEFAULT_STATE;
+  const domainRegex = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+  if (!domainRegex.test(s)) {
+    return null;
   }
 
-  public async saveState(state: InspectionState, _jobId: string = 'current'): Promise<void> {
-    state.updatedAt = new Date().toISOString();
-    state.stats = calculateStats(state.items);
-    await setState(state);
-    this.emit('update', {
-      event: 'state_updated',
-      state
-    });
+  return s;
+}
+
+export function parseInputDomains(input: string[] | string): string[] {
+  let lines: string[] = [];
+  if (Array.isArray(input)) {
+    lines = input;
+  } else if (typeof input === 'string') {
+    lines = input.split(/\r?\n/);
   }
 
-  public async persistItemStep(item: DomainItem, _jobId: string = 'current'): Promise<void> {
-    await setItem(item);
-    this.emit('update', {
-      event: 'item_updated',
-      item
-    });
+  const seen = new Set<string>();
+  const validDomains: string[] = [];
+
+  for (const raw of lines) {
+    const clean = normalizeDomain(raw);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      validDomains.push(clean);
+    }
   }
 
-  public async startJob(
-    domains: string[] | string,
-    customSettings?: Partial<CheckerSettings>,
-    jobId: string = 'current'
-  ): Promise<InspectionState> {
-    const currentState = await getState();
-    const settings: CheckerSettings = {
-      ...DEFAULT_SETTINGS,
-      ...currentState.settings,
-      ...customSettings
-    };
+  return validDomains;
+}
 
-    const normalizedDomains = this.parseInputDomains(domains);
+export function addLog(
+  item: DomainItem,
+  step: DomainLog['step'],
+  message: string,
+  type: DomainLog['type']
+) {
+  item.logs.push({
+    step,
+    timestamp: new Date().toISOString(),
+    message,
+    type
+  });
+}
 
-    const items: DomainItem[] = normalizedDomains.map((domain, index) => {
-      const id = crypto.randomUUID();
-      return {
-        id,
-        domain,
-        cleanDomain: domain,
-        originalIndex: index + 1,
-        status: 'pending',
-        currentStep: 'idle',
-        currentWorkerId: null,
-        ssl: {
-          status: settings.enableSSL ? 'CHECKING' : 'UNKNOWN',
-          valid: false,
-          reason: settings.enableSSL ? 'Queued' : 'SSL check disabled in settings'
-        },
-        website: {
-          status: settings.enableWebsite ? 'CHECKING' : 'UNKNOWN',
-          available: false,
-          reason: settings.enableWebsite ? 'Queued' : 'Website check disabled in settings',
-          statusCode: null,
-          finalUrl: `https://${domain}`,
-          title: '',
-          redirects: [],
-          loadTimeMs: 0
-        },
-        whois: {
-          status: settings.enableWhois ? 'CHECKING' : 'SKIPPED',
-          registeredOn: null,
-          updatedOn: null,
-          expiresOn: null,
-          registrar: null,
-          domainStatus: [],
-          nameservers: [],
-          rawSummary: null,
-          source: settings.enableWhois ? 'none' : 'skipped'
-        },
-        retries: 0,
-        maxRetries: settings.maxRetries,
-        logs: [
-          {
-            step: 'system',
-            timestamp: new Date().toISOString(),
-            message: `Domain #${index + 1} queued for inspection`,
-            type: 'info'
-          }
-        ]
+/**
+ * STRICT 7-STEP SEQUENTIAL PIPELINE PER DOMAIN
+ * STEP 1 -> SSL CHECK
+ * STEP 2 -> SAVE SSL RESULT
+ * STEP 3 -> WEBSITE CHECK
+ * STEP 4 -> SAVE WEBSITE RESULT
+ * STEP 5 -> WHOIS/RDAP LOOKUP
+ * STEP 6 -> SAVE REGISTRATION INFORMATION
+ * STEP 7 -> MARK DOMAIN AS COMPLETED
+ */
+export async function processDomainSequential(
+  item: DomainItem,
+  workerId: number,
+  settings: CheckerSettings
+): Promise<DomainItem> {
+  const timeoutMs = (settings.timeoutSeconds || 30) * 1000;
+  item.status = 'checking';
+  item.currentWorkerId = workerId;
+  item.startedAt = item.startedAt || new Date().toISOString();
+
+  // STEP 1 & 2: SSL CHECK & SAVE
+  if (settings.enableSSL) {
+    item.currentStep = 'ssl';
+    addLog(item, 'ssl', `Worker #${workerId}: Starting TLS certificate check on port 443...`, 'info');
+
+    try {
+      const sslRes = await checkDomainSSL(item.cleanDomain, {
+        timeoutMs: Math.min(timeoutMs, 15000)
+      });
+      item.ssl = sslRes;
+
+      const logType = sslRes.status === 'YES' ? 'success' : 'warn';
+      addLog(
+        item,
+        'ssl',
+        `Worker #${workerId}: SSL Check completed: ${sslRes.status} (${sslRes.reason})`,
+        logType
+      );
+    } catch (sslErr: any) {
+      item.ssl = {
+        status: 'NO',
+        valid: false,
+        reason: `SSL check exception: ${sslErr.message}`,
+        checkedAt: new Date().toISOString()
       };
-    });
+      addLog(item, 'ssl', `Worker #${workerId}: SSL Check error: ${sslErr.message}`, 'error');
+    }
+  }
 
-    const newState: InspectionState = {
-      status: items.length > 0 ? 'running' : 'completed',
-      items,
+  // STEP 3 & 4: WEBSITE CHECK & SAVE
+  if (settings.enableWebsite) {
+    item.currentStep = 'website';
+    addLog(item, 'website', `Worker #${workerId}: Starting Website availability inspection...`, 'info');
+
+    try {
+      const webRes = await checkDomainWebsite(item.cleanDomain, { timeoutMs });
+      item.website = webRes;
+
+      const logType =
+        webRes.status === 'YES' ? 'success' : webRes.status === 'UNKNOWN' ? 'warn' : 'error';
+      addLog(
+        item,
+        'website',
+        `Worker #${workerId}: Website Check completed: ${webRes.status} (${webRes.reason})`,
+        logType
+      );
+    } catch (webErr: any) {
+      item.website = {
+        status: 'UNKNOWN',
+        available: false,
+        reason: `Website check exception: ${webErr.message}`,
+        statusCode: null,
+        finalUrl: `http://${item.cleanDomain}`,
+        title: '',
+        redirects: [],
+        loadTimeMs: 0,
+        detectedExclusionType: 'other',
+        checkedAt: new Date().toISOString()
+      };
+      addLog(item, 'website', `Worker #${workerId}: Website Check error: ${webErr.message}`, 'error');
+    }
+  }
+
+  // STEP 5 & 6: WHOIS / RDAP LOOKUP & SAVE
+  if (settings.enableWhois) {
+    item.currentStep = 'whois';
+    addLog(item, 'whois', `Worker #${workerId}: Querying RDAP registration data...`, 'info');
+
+    try {
+      const whoisRes = await checkDomainWhois(item.cleanDomain, {
+        timeoutMs: 14000,
+        pacedDelayMs: settings.whoisPacedDelayMs || 800,
+        maxAttempts: 3,
+        onRetry: (attempt, msg) => {
+          addLog(item, 'whois', `Worker #${workerId} (Attempt ${attempt}): ${msg}`, 'info');
+        }
+      });
+      item.whois = whoisRes;
+
+      const logType =
+        whoisRes.status === 'FOUND' && whoisRes.registeredOn ? 'success' : 'info';
+      addLog(
+        item,
+        'whois',
+        `Worker #${workerId}: Registration info: ${whoisRes.status} (${whoisRes.registrar || 'No registrar'} | ${whoisRes.registeredOn || 'Unavailable'})`,
+        logType
+      );
+    } catch (whoisErr: any) {
+      item.whois = {
+        status: 'NOT_FOUND',
+        registeredOn: null,
+        updatedOn: null,
+        expiresOn: null,
+        registrar: null,
+        domainStatus: [],
+        nameservers: [],
+        rawSummary: `WHOIS lookup error: ${whoisErr.message}`,
+        source: 'none',
+        checkedAt: new Date().toISOString()
+      };
+      addLog(item, 'whois', `Worker #${workerId}: Registration check error: ${whoisErr.message}`, 'warn');
+    }
+  }
+
+  // STEP 7: MARK DOMAIN AS COMPLETED OR RETRY REQUIRED
+  item.currentStep = 'done';
+  item.completedAt = new Date().toISOString();
+  item.currentWorkerId = null;
+
+  if (item.website.status === 'UNKNOWN' && item.retries < item.maxRetries) {
+    item.status = 'retry_required';
+    addLog(item, 'system', `Domain marked as Retry Required (${item.website.reason})`, 'warn');
+  } else {
+    item.status = 'completed';
+    addLog(item, 'system', `All inspection steps completed successfully`, 'success');
+  }
+
+  return item;
+}
+
+/**
+ * Creates empty/queued DomainItems for a list of normalized domains
+ */
+export function createDomainItems(
+  domains: string[],
+  settings: CheckerSettings,
+  startIndex: number = 1
+): DomainItem[] {
+  return domains.map((domain, idx) => ({
+    id: crypto.randomUUID(),
+    domain,
+    cleanDomain: domain,
+    originalIndex: startIndex + idx,
+    status: 'pending',
+    currentStep: 'idle',
+    currentWorkerId: null,
+    ssl: {
+      status: settings.enableSSL ? 'CHECKING' : 'UNKNOWN',
+      valid: false,
+      reason: settings.enableSSL ? 'Queued' : 'SSL check disabled'
+    },
+    website: {
+      status: settings.enableWebsite ? 'CHECKING' : 'UNKNOWN',
+      available: false,
+      reason: settings.enableWebsite ? 'Queued' : 'Website check disabled',
+      statusCode: null,
+      finalUrl: `https://${domain}`,
+      title: '',
+      redirects: [],
+      loadTimeMs: 0
+    },
+    whois: {
+      status: settings.enableWhois ? 'CHECKING' : 'SKIPPED',
+      registeredOn: null,
+      updatedOn: null,
+      expiresOn: null,
+      registrar: null,
+      domainStatus: [],
+      nameservers: [],
+      rawSummary: null,
+      source: settings.enableWhois ? 'none' : 'skipped'
+    },
+    retries: 0,
+    maxRetries: settings.maxRetries,
+    logs: [
+      {
+        step: 'system',
+        timestamp: new Date().toISOString(),
+        message: `Domain #${startIndex + idx} queued for inspection`,
+        type: 'info'
+      }
+    ]
+  }));
+}
+
+/**
+ * Fully stateless inspection engine:
+ * Runs worker pool with up to `settings.workers` concurrent inspections.
+ * Returns complete InspectionState directly in response.
+ */
+export async function inspectDomains(
+  domainsInput: string[] | string,
+  customSettings?: Partial<CheckerSettings>
+): Promise<InspectionState> {
+  const settings: CheckerSettings = {
+    ...DEFAULT_SETTINGS,
+    ...customSettings
+  };
+
+  const normalized = parseInputDomains(domainsInput);
+  const items = createDomainItems(normalized, settings);
+
+  if (items.length === 0) {
+    return {
+      status: 'completed',
+      items: [],
       settings,
-      stats: calculateStats(items),
+      stats: calculateStats([]),
       activeWorkers: 0,
       currentWorkerAssignments: {},
       startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      needsContinue: items.length > 0
+      updatedAt: new Date().toISOString()
     };
-
-    // CRITICAL: Persist initial state IMMEDIATELY before starting checks!
-    // This ensures any subsequent /api/status request receives the running state.
-    await this.saveState(newState, jobId);
-
-    // Process first batch/chunk inline within serverless budget
-    if (items.length > 0) {
-      await this.processJobChunk(15000, jobId);
-    }
-
-    return this.getFullState(jobId);
   }
 
-  /**
-   * Heartbeat / Tick: called on /api/status polling.
-   * If job is running and more work remains, processes the next chunk and persists results.
-   */
-  public async tickOrStatus(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    if (state.status === 'running') {
-      const hasPending = state.items.some((it) => it.status === 'pending');
-      if ((hasPending || state.needsContinue) && !this.isProcessing) {
-        await this.processJobChunk(8000, jobId);
-      } else if (!hasPending && state.activeWorkers === 0) {
-        state.status = 'completed';
-        state.needsContinue = false;
-        await this.saveState(state, jobId);
-      }
-    }
-    return this.getFullState(jobId);
-  }
+  const workerCount = Math.min(Math.max(settings.workers || 4, 1), 8);
+  let nextQueueIndex = 0;
 
-  public async pauseJob(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    if (state.status === 'running') {
-      state.status = 'paused';
-      state.needsContinue = false;
-      state.activeWorkers = 0;
-      state.currentWorkerAssignments = {};
-      await this.saveState(state, jobId);
-    }
-    return state;
-  }
-
-  public async resumeJob(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    if (state.status === 'paused') {
-      state.status = 'running';
-      state.needsContinue = true;
-      await this.saveState(state, jobId);
-      await this.processJobChunk(15000, jobId);
-    }
-    return this.getFullState(jobId);
-  }
-
-  public async stopJob(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    state.status = 'stopped';
-    state.needsContinue = false;
-    state.activeWorkers = 0;
-    state.currentWorkerAssignments = {};
-
-    for (const item of state.items) {
-      if (item.status === 'pending' || item.status === 'checking') {
+  // Run worker pool
+  async function runWorker(workerId: number) {
+    while (nextQueueIndex < items.length) {
+      const idx = nextQueueIndex++;
+      const item = items[idx];
+      try {
+        await processDomainSequential(item, workerId, settings);
+      } catch (err: any) {
         item.status = 'failed';
         item.currentStep = 'done';
-        if (item.ssl.status === 'CHECKING') item.ssl.status = 'UNKNOWN';
-        if (item.website.status === 'CHECKING') item.website.status = 'UNKNOWN';
-        if (item.whois.status === 'CHECKING') item.whois.status = 'NOT_FOUND';
+        addLog(item, 'system', `Worker #${workerId} failure: ${err.message}`, 'error');
       }
     }
-
-    await this.saveState(state, jobId);
-    return state;
   }
 
-  public async retryItem(itemId: string, jobId: string = 'current'): Promise<boolean> {
-    const state = await this.getFullState(jobId);
-    const item = state.items.find((i) => i.id === itemId);
-    if (!item) return false;
-
-    item.status = 'pending';
-    item.currentStep = 'idle';
-    item.retries += 1;
-    item.logs.push({
-      step: 'system',
-      timestamp: new Date().toISOString(),
-      message: `Manual retry requested (Attempt ${item.retries + 1})`,
-      type: 'info'
-    });
-
-    if (state.settings.enableSSL) item.ssl.status = 'CHECKING';
-    if (state.settings.enableWebsite) item.website.status = 'CHECKING';
-    if (state.settings.enableWhois) item.whois.status = 'CHECKING';
-
-    state.status = 'running';
-    state.needsContinue = true;
-    await this.saveState(state, jobId);
-    await this.processJobChunk(15000, jobId);
-    return true;
+  const activeWorkerPromises: Promise<void>[] = [];
+  for (let w = 1; w <= Math.min(workerCount, items.length); w++) {
+    activeWorkerPromises.push(runWorker(w));
   }
 
-  public async retryAllIssues(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    let queuedCount = 0;
+  await Promise.all(activeWorkerPromises);
 
-    for (const item of state.items) {
-      const isIssue =
-        item.status === 'failed' ||
-        item.status === 'retry_required' ||
-        item.website.status === 'UNKNOWN' ||
-        item.ssl.status === 'UNKNOWN';
+  return {
+    status: 'completed',
+    items,
+    settings,
+    stats: calculateStats(items),
+    activeWorkers: 0,
+    currentWorkerAssignments: {},
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
 
-      if (isIssue) {
-        item.status = 'pending';
-        item.currentStep = 'idle';
-        item.retries += 1;
-        item.logs.push({
-          step: 'system',
-          timestamp: new Date().toISOString(),
-          message: `Batch retry requested (Attempt ${item.retries + 1})`,
-          type: 'info'
-        });
-        if (state.settings.enableSSL) item.ssl.status = 'CHECKING';
-        if (state.settings.enableWebsite) item.website.status = 'CHECKING';
-        if (state.settings.enableWhois) item.whois.status = 'CHECKING';
-        queuedCount++;
-      }
-    }
+/**
+ * Re-runs WHOIS lookup only for specified domains
+ */
+export async function recheckWhoisOnly(
+  domains: string[],
+  settings?: Partial<CheckerSettings>
+): Promise<Array<{ domain: string; whois: WhoisResult }>> {
+  const whoisPacedDelayMs = settings?.whoisPacedDelayMs || 800;
+  const results: Array<{ domain: string; whois: WhoisResult }> = [];
 
-    if (queuedCount > 0) {
-      state.status = 'running';
-      state.needsContinue = true;
-      await this.saveState(state, jobId);
-      await this.processJobChunk(15000, jobId);
-    }
-
-    return this.getFullState(jobId);
-  }
-
-  public async recheckMissingDates(jobId: string = 'current'): Promise<InspectionState> {
-    const state = await this.getFullState(jobId);
-    const missingItems = state.items.filter(
-      (it) => it.whois.status !== 'FOUND' || !it.whois.registeredOn
-    );
-
-    if (missingItems.length === 0) return state;
-
-    // Take next batch of missing items with deliberate pacing
-    const batch = missingItems.slice(0, 4);
-    const paceMs = Math.max(state.settings.whoisPacedDelayMs || 800, 600);
-
-    for (const item of batch) {
-      item.whois.status = 'CHECKING';
-      await this.persistItemStep(item, jobId);
-
-      try {
-        const res = await checkDomainWhois(item.cleanDomain, {
-          timeoutMs: 14000,
-          pacedDelayMs: paceMs,
-          maxAttempts: 3
-        });
-        item.whois = res;
-        this.log(
-          item,
-          'whois',
-          `Re-check result: ${res.status} (${res.registrar || 'N/A'} | ${res.registeredOn || 'Unavailable'})`,
-          res.status === 'FOUND' && res.registeredOn ? 'success' : 'warn'
-        );
-      } catch (err: any) {
-        this.log(item, 'whois', `Re-check error: ${err.message}`, 'error');
-      }
-
-      await this.persistItemStep(item, jobId);
-    }
-
-    return this.getFullState(jobId);
-  }
-
-  /**
-   * Processes a chunk of domain inspections within a given time budget.
-   * Adheres to configured parallel workers and executes the 7-step pipeline per domain.
-   */
-  public async processJobChunk(timeBudgetMs: number = 10000, jobId: string = 'current'): Promise<void> {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
-
-    const startTime = Date.now();
+  for (const raw of domains) {
+    const clean = normalizeDomain(raw);
+    if (!clean) continue;
 
     try {
-      while (Date.now() - startTime < timeBudgetMs) {
-        const state = await this.getFullState(jobId);
-        if (state.status !== 'running') break;
-
-        const pendingItems = state.items.filter((it) => it.status === 'pending');
-        if (pendingItems.length === 0) {
-          state.status = 'completed';
-          state.needsContinue = false;
-          state.activeWorkers = 0;
-          state.currentWorkerAssignments = {};
-          await this.saveState(state, jobId);
-          break;
-        }
-
-        const maxWorkers = Math.min(Math.max(state.settings.workers || 4, 1), 8);
-        const batch = pendingItems.slice(0, maxWorkers);
-
-        // Assign workers
-        state.activeWorkers = batch.length;
-        state.currentWorkerAssignments = {};
-        batch.forEach((item, index) => {
-          const workerId = index + 1;
-          item.currentWorkerId = workerId;
-          item.status = 'checking';
-          item.startedAt = item.startedAt || new Date().toISOString();
-          state.currentWorkerAssignments[workerId] = item.domain;
-        });
-
-        await this.saveState(state, jobId);
-
-        // Execute batch domains in parallel using configured workers
-        await Promise.all(
-          batch.map((item, index) =>
-            this.processDomainSequential(item, index + 1, state.settings, jobId).catch(async (err) => {
-              this.log(item, 'system', `Unexpected worker error: ${err.message}`, 'error');
-              item.status = 'failed';
-              item.currentStep = 'done';
-              await this.persistItemStep(item, jobId);
-            })
-          )
-        );
-
-        // Free workers
-        const refreshedState = await this.getFullState(jobId);
-        refreshedState.activeWorkers = 0;
-        refreshedState.currentWorkerAssignments = {};
-
-        const remainingPending = refreshedState.items.filter((it) => it.status === 'pending');
-        if (remainingPending.length === 0) {
-          refreshedState.status = 'completed';
-          refreshedState.needsContinue = false;
-        } else {
-          refreshedState.needsContinue = true;
-        }
-
-        await this.saveState(refreshedState, jobId);
-
-        // If time budget exhausted or no more items, exit loop
-        if (remainingPending.length === 0 || Date.now() - startTime >= timeBudgetMs) {
-          break;
-        }
-      }
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  /**
-   * STRICT 7-STEP SEQUENTIAL PIPELINE PER DOMAIN
-   * STEP 1 -> SSL CHECK
-   * STEP 2 -> SAVE SSL RESULT (persisted immediately)
-   * STEP 3 -> WEBSITE CHECK
-   * STEP 4 -> SAVE WEBSITE RESULT (persisted immediately)
-   * STEP 5 -> WHOIS/RDAP LOOKUP
-   * STEP 6 -> SAVE REGISTRATION INFORMATION (persisted immediately)
-   * STEP 7 -> MARK DOMAIN AS COMPLETED (persisted immediately)
-   */
-  public async processDomainSequential(
-    item: DomainItem,
-    workerId: number,
-    settings: CheckerSettings,
-    jobId: string = 'current'
-  ): Promise<void> {
-    const timeoutMs = (settings.timeoutSeconds || 30) * 1000;
-
-    // STEP 1 & 2: SSL CHECK & SAVE
-    if (settings.enableSSL) {
-      item.currentStep = 'ssl';
-      this.log(item, 'ssl', `Worker #${workerId}: Starting TLS certificate check on port 443...`, 'info');
-      await this.persistItemStep(item, jobId);
-
-      try {
-        const sslRes = await checkDomainSSL(item.cleanDomain, { timeoutMs: Math.min(timeoutMs, 15000) });
-        item.ssl = sslRes;
-
-        const logType = sslRes.status === 'YES' ? 'success' : 'warn';
-        this.log(item, 'ssl', `Worker #${workerId}: SSL Check completed: ${sslRes.status} (${sslRes.reason})`, logType);
-      } catch (sslErr: any) {
-        item.ssl = {
-          status: 'NO',
-          valid: false,
-          reason: `SSL check exception: ${sslErr.message}`,
-          checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'ssl', `Worker #${workerId}: SSL Check error: ${sslErr.message}`, 'error');
-      }
-
-      await this.persistItemStep(item, jobId);
-    }
-
-    // STEP 3 & 4: WEBSITE CHECK & SAVE
-    if (settings.enableWebsite) {
-      item.currentStep = 'website';
-      this.log(item, 'website', `Worker #${workerId}: Starting Website availability inspection...`, 'info');
-      await this.persistItemStep(item, jobId);
-
-      try {
-        const webRes = await checkDomainWebsite(item.cleanDomain, { timeoutMs });
-        item.website = webRes;
-
-        const logType = webRes.status === 'YES' ? 'success' : webRes.status === 'UNKNOWN' ? 'warn' : 'error';
-        this.log(item, 'website', `Worker #${workerId}: Website Check completed: ${webRes.status} (${webRes.reason})`, logType);
-      } catch (webErr: any) {
-        item.website = {
-          status: 'UNKNOWN',
-          available: false,
-          reason: `Website check exception: ${webErr.message}`,
-          statusCode: null,
-          finalUrl: `http://${item.cleanDomain}`,
-          title: '',
-          redirects: [],
-          loadTimeMs: 0,
-          detectedExclusionType: 'other',
-          checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'website', `Worker #${workerId}: Website Check error: ${webErr.message}`, 'error');
-      }
-
-      await this.persistItemStep(item, jobId);
-    }
-
-    // STEP 5 & 6: WHOIS / RDAP LOOKUP & SAVE
-    if (settings.enableWhois) {
-      item.currentStep = 'whois';
-      this.log(item, 'whois', `Worker #${workerId}: Querying RDAP registration data...`, 'info');
-      await this.persistItemStep(item, jobId);
-
-      try {
-        const whoisRes = await checkDomainWhois(item.cleanDomain, {
-          timeoutMs: 14000,
-          pacedDelayMs: settings.whoisPacedDelayMs || 800,
-          maxAttempts: 3,
-          onRetry: (attempt, msg) => {
-            this.log(item, 'whois', `Worker #${workerId} (Attempt ${attempt}): ${msg}`, 'info');
-          }
-        });
-        item.whois = whoisRes;
-
-        const logType = whoisRes.status === 'FOUND' && whoisRes.registeredOn ? 'success' : 'info';
-        this.log(
-          item,
-          'whois',
-          `Worker #${workerId}: Registration info: ${whoisRes.status} (${whoisRes.registrar || 'No registrar'} | ${whoisRes.registeredOn || 'Unavailable'})`,
-          logType
-        );
-      } catch (whoisErr: any) {
-        item.whois = {
+      const whois = await checkDomainWhois(clean, {
+        timeoutMs: 14000,
+        pacedDelayMs: whoisPacedDelayMs,
+        maxAttempts: 3
+      });
+      results.push({ domain: clean, whois });
+    } catch (err: any) {
+      results.push({
+        domain: clean,
+        whois: {
           status: 'NOT_FOUND',
           registeredOn: null,
           updatedOn: null,
@@ -492,170 +450,195 @@ export class JobManager extends EventEmitter {
           registrar: null,
           domainStatus: [],
           nameservers: [],
-          rawSummary: `WHOIS lookup error: ${whoisErr.message}`,
+          rawSummary: `WHOIS check failed: ${err.message}`,
           source: 'none',
           checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'whois', `Worker #${workerId}: Registration check error: ${whoisErr.message}`, 'warn');
+        }
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * CRITICAL REQUIREMENT: PRESERVE ORIGINAL INPUT ORDER
+ * Sorts strictly by originalIndex before export!
+ */
+export function generateExportData(items: DomainItem[]): Array<Record<string, any>> {
+  const sorted = [...items].sort((a, b) => a.originalIndex - b.originalIndex);
+
+  return sorted.map((item) => ({
+    '#': item.originalIndex,
+    'Domain': item.domain,
+    'Registered On': item.whois.registeredOn || 'N/A',
+    'Updated On': item.whois.updatedOn || 'N/A',
+    'Expires On': item.whois.expiresOn || 'N/A',
+    'Registrar': item.whois.registrar || 'N/A',
+    'SSL': item.ssl.status,
+    'SSL Reason': item.ssl.reason,
+    'SSL Issuer': item.ssl.issuer || 'N/A',
+    'SSL Expiry': item.ssl.validTo || 'N/A',
+    'Days Until Expiry': item.ssl.daysRemaining !== undefined ? item.ssl.daysRemaining : 'N/A',
+    'Website': item.website.status,
+    'Website Reason': item.website.reason,
+    'Final URL': item.website.finalUrl || `https://${item.domain}`,
+    'HTTP Status': item.website.statusCode ?? 'N/A',
+    'Load Time (ms)': item.website.loadTimeMs || 0,
+    'Completed At': item.completedAt || 'In progress'
+  }));
+}
+
+export function exportToCsv(items: DomainItem[]): string {
+  const data = generateExportData(items);
+  if (data.length === 0) {
+    return '#,Domain,Registered On,Updated On,Expires On,Registrar,SSL,SSL Reason,SSL Issuer,SSL Expiry,Days Until Expiry,Website,Website Reason,Final URL,HTTP Status,Load Time (ms),Completed At\n';
+  }
+
+  const headers = Object.keys(data[0]);
+  const escapeCsv = (val: any) => {
+    if (val === null || val === undefined) return '""';
+    const str = String(val).replace(/"/g, '""');
+    return `"${str}"`;
+  };
+
+  const headerLine = headers.map(escapeCsv).join(',');
+  const rows = data.map((row) => headers.map((h) => escapeCsv(row[h])).join(','));
+
+  return [headerLine, ...rows].join('\r\n');
+}
+
+export function exportToExcel(items: DomainItem[]): Buffer {
+  const data = generateExportData(items);
+  const worksheet = XLSX.utils.json_to_sheet(data);
+
+  const colWidths = [
+    { wch: 4 },  // #
+    { wch: 25 }, // Domain
+    { wch: 14 }, // Registered On
+    { wch: 14 }, // Updated On
+    { wch: 14 }, // Expires On
+    { wch: 22 }, // Registrar
+    { wch: 10 }, // SSL
+    { wch: 36 }, // SSL Reason
+    { wch: 26 }, // SSL Issuer
+    { wch: 14 }, // SSL Expiry
+    { wch: 18 }, // Days Until Expiry
+    { wch: 10 }, // Website
+    { wch: 38 }, // Website Reason
+    { wch: 30 }, // Final URL
+    { wch: 12 }, // HTTP Status
+    { wch: 14 }, // Load Time (ms)
+    { wch: 22 }  // Completed At
+  ];
+  worksheet['!cols'] = colWidths;
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Domain Inspection');
+
+  return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+}
+
+// Stateful/in-memory adapter for local dev server and test-suite compatibility
+let localMemoryState: InspectionState = JSON.parse(JSON.stringify(DEFAULT_STATE));
+
+export class JobManager {
+  private currentState: InspectionState = JSON.parse(JSON.stringify(DEFAULT_STATE));
+
+  public normalizeDomain(raw: string) {
+    return normalizeDomain(raw);
+  }
+
+  public parseInputDomains(input: string[] | string) {
+    return parseInputDomains(input);
+  }
+
+  public async getFullState(): Promise<InspectionState> {
+    return this.currentState;
+  }
+
+  public getFullStateSync(): InspectionState {
+    return this.currentState;
+  }
+
+  public async startJob(
+    domains: string[] | string,
+    settings?: Partial<CheckerSettings>
+  ): Promise<InspectionState> {
+    this.currentState = await inspectDomains(domains, settings);
+    localMemoryState = this.currentState;
+    return this.currentState;
+  }
+
+  public async tickOrStatus(): Promise<InspectionState> {
+    return this.currentState;
+  }
+
+  public async pauseJob(): Promise<InspectionState> {
+    this.currentState.status = 'paused';
+    return this.currentState;
+  }
+
+  public async resumeJob(): Promise<InspectionState> {
+    this.currentState.status = 'completed';
+    return this.currentState;
+  }
+
+  public async stopJob(): Promise<InspectionState> {
+    this.currentState.status = 'stopped';
+    return this.currentState;
+  }
+
+  public async retryItem(itemId: string): Promise<boolean> {
+    const item = this.currentState.items.find((i) => i.id === itemId);
+    if (!item) return false;
+    await processDomainSequential(item, 1, this.currentState.settings);
+    this.currentState.stats = calculateStats(this.currentState.items);
+    return true;
+  }
+
+  public async retryAllIssues(): Promise<InspectionState> {
+    const issues = this.currentState.items.filter(
+      (it) => it.ssl.status !== 'YES' || it.website.status !== 'YES'
+    );
+    for (const item of issues) {
+      await processDomainSequential(item, 1, this.currentState.settings);
+    }
+    this.currentState.stats = calculateStats(this.currentState.items);
+    return this.currentState;
+  }
+
+  public async recheckMissingDates(): Promise<InspectionState> {
+    const missing = this.currentState.items.filter(
+      (it) => !it.whois.registeredOn || it.whois.status !== 'FOUND'
+    );
+    const domainNames = missing.map((m) => m.cleanDomain);
+    const results = await recheckWhoisOnly(domainNames, this.currentState.settings);
+    for (const res of results) {
+      const match = this.currentState.items.find((it) => it.cleanDomain === res.domain);
+      if (match) {
+        match.whois = res.whois;
       }
-
-      await this.persistItemStep(item, jobId);
     }
-
-    // STEP 7: MARK DOMAIN AS COMPLETED OR RETRY REQUIRED
-    item.currentStep = 'done';
-    item.completedAt = new Date().toISOString();
-    item.currentWorkerId = null;
-
-    if (item.website.status === 'UNKNOWN' && item.retries < item.maxRetries) {
-      item.status = 'retry_required';
-      this.log(item, 'system', `Domain marked as Retry Required (${item.website.reason})`, 'warn');
-    } else {
-      item.status = 'completed';
-      this.log(item, 'system', `All inspection steps completed successfully`, 'success');
-    }
-
-    await this.persistItemStep(item, jobId);
+    this.currentState.stats = calculateStats(this.currentState.items);
+    return this.currentState;
   }
 
-  public log(item: DomainItem, step: DomainLog['step'], message: string, type: DomainLog['type']) {
-    item.logs.push({
-      step,
-      timestamp: new Date().toISOString(),
-      message,
-      type
-    });
+  public async getExportData(): Promise<Array<Record<string, any>>> {
+    return generateExportData(this.currentState.items);
   }
 
-  public parseInputDomains(input: string[] | string): string[] {
-    let lines: string[] = [];
-    if (Array.isArray(input)) {
-      lines = input;
-    } else if (typeof input === 'string') {
-      lines = input.split(/\r?\n/);
-    }
-
-    const seen = new Set<string>();
-    const validDomains: string[] = [];
-
-    for (const raw of lines) {
-      const clean = this.normalizeDomain(raw);
-      if (clean && !seen.has(clean)) {
-        seen.add(clean);
-        validDomains.push(clean);
-      }
-    }
-
-    return validDomains;
+  public async exportToCsv(): Promise<string> {
+    return exportToCsv(this.currentState.items);
   }
 
-  public normalizeDomain(raw: string): string | null {
-    if (!raw) return null;
-    let s = raw.trim();
-
-    s = s.replace(/^["']|["']$/g, '').trim();
-    s = s.replace(/^(?:https?:\/\/)/i, '');
-    s = s.split('/')[0].split('?')[0].split('#')[0];
-    s = s.split(':')[0];
-    s = s.toLowerCase().trim();
-
-    if (!s || s.includes(' ') || s.includes('@')) {
-      return null;
-    }
-
-    const domainRegex = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
-    if (!domainRegex.test(s)) {
-      return null;
-    }
-
-    return s;
+  public async exportToExcel(): Promise<Buffer> {
+    return exportToExcel(this.currentState.items);
   }
 
-  public computeStats(items: DomainItem[]): InspectionStats {
-    return calculateStats(items);
-  }
-
-  /**
-   * CRITICAL REQUIREMENT: PRESERVE ORIGINAL INPUT ORDER
-   * Sorts strictly by originalIndex before export!
-   */
-  public async getExportData(jobId: string = 'current'): Promise<Array<Record<string, any>>> {
-    const state = await this.getFullState(jobId);
-    const items = [...state.items];
-
-    // Sort strictly by permanent originalIndex
-    items.sort((a, b) => a.originalIndex - b.originalIndex);
-
-    return items.map((item) => ({
-      '#': item.originalIndex,
-      'Domain': item.domain,
-      'Registered On': item.whois.registeredOn || 'N/A',
-      'Updated On': item.whois.updatedOn || 'N/A',
-      'Expires On': item.whois.expiresOn || 'N/A',
-      'Registrar': item.whois.registrar || 'N/A',
-      'SSL': item.ssl.status,
-      'SSL Reason': item.ssl.reason,
-      'SSL Issuer': item.ssl.issuer || 'N/A',
-      'SSL Expiry': item.ssl.validTo || 'N/A',
-      'Days Until Expiry': item.ssl.daysRemaining !== undefined ? item.ssl.daysRemaining : 'N/A',
-      'Website': item.website.status,
-      'Website Reason': item.website.reason,
-      'Final URL': item.website.finalUrl || `https://${item.domain}`,
-      'HTTP Status': item.website.statusCode ?? 'N/A',
-      'Load Time (ms)': item.website.loadTimeMs || 0,
-      'Completed At': item.completedAt || 'In progress'
-    }));
-  }
-
-  public async exportToCsv(jobId: string = 'current'): Promise<string> {
-    const data = await this.getExportData(jobId);
-    if (data.length === 0) {
-      return '#,Domain,Registered On,Updated On,Expires On,Registrar,SSL,SSL Reason,SSL Issuer,SSL Expiry,Days Until Expiry,Website,Website Reason,Final URL,HTTP Status,Load Time (ms),Completed At\n';
-    }
-
-    const headers = Object.keys(data[0]);
-    const escapeCsv = (val: any) => {
-      if (val === null || val === undefined) return '""';
-      const str = String(val).replace(/"/g, '""');
-      return `"${str}"`;
-    };
-
-    const headerLine = headers.map(escapeCsv).join(',');
-    const rows = data.map((row) => headers.map((h) => escapeCsv(row[h])).join(','));
-
-    return [headerLine, ...rows].join('\r\n');
-  }
-
-  public async exportToExcel(jobId: string = 'current'): Promise<Buffer> {
-    const data = await this.getExportData(jobId);
-    const worksheet = XLSX.utils.json_to_sheet(data);
-
-    const colWidths = [
-      { wch: 4 },  // #
-      { wch: 25 }, // Domain
-      { wch: 14 }, // Registered On
-      { wch: 14 }, // Updated On
-      { wch: 14 }, // Expires On
-      { wch: 22 }, // Registrar
-      { wch: 10 }, // SSL
-      { wch: 36 }, // SSL Reason
-      { wch: 26 }, // SSL Issuer
-      { wch: 14 }, // SSL Expiry
-      { wch: 18 }, // Days Until Expiry
-      { wch: 10 }, // Website
-      { wch: 38 }, // Website Reason
-      { wch: 30 }, // Final URL
-      { wch: 12 }, // HTTP Status
-      { wch: 14 }, // Load Time (ms)
-      { wch: 22 }  // Completed At
-    ];
-    worksheet['!cols'] = colWidths;
-
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Domain Inspection');
-
-    return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-  }
+  public on(_event: string, _fn: any) {}
+  public emit(_event: string, _data: any) {}
 }
 
 export const jobManager = new JobManager();
+

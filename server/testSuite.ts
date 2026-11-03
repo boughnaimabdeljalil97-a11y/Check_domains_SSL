@@ -131,7 +131,7 @@ export async function runFullTestSuite(): Promise<{
     ];
 
     const state = await testManager.startJob(sampleInput);
-    const parsed = state.items.map((it) => it.domain);
+    const parsed = state.items.map((it: any) => it.domain);
 
     // Verify ordering
     const matchesOriginal =
