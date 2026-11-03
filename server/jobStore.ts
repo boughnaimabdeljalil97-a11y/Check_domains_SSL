@@ -1,113 +1,186 @@
-import pg from 'pg';
-import type { InspectionState } from './types.js';
+import { createClient } from '@vercel/kv';
+import type { DomainItem, InspectionState, InspectionStats, CheckerSettings } from './types.js';
 
-const { Pool } = pg;
+export const STATE_KEY = 'inspection:current';
 
-export interface JobStore {
-  getJob(jobId?: string): Promise<InspectionState | null>;
-  saveJob(jobId: string, state: InspectionState): Promise<void>;
-  listJobs(): Promise<Array<{ id: string; updatedAt: string }>>;
+export const DEFAULT_SETTINGS: CheckerSettings = {
+  workers: 4,
+  timeoutSeconds: 30,
+  maxRetries: 2,
+  enableSSL: true,
+  enableWebsite: true,
+  enableWhois: true,
+  whoisPacedDelayMs: 800
+};
+
+export const DEFAULT_STATE: InspectionState = {
+  status: 'idle',
+  items: [],
+  settings: DEFAULT_SETTINGS,
+  stats: {
+    total: 0,
+    completed: 0,
+    pending: 0,
+    inFlight: 0,
+    retryRequired: 0,
+    sslYes: 0,
+    sslNo: 0,
+    websiteYes: 0,
+    websiteNo: 0,
+    bothYes: 0,
+    whoisFound: 0,
+    percentComplete: 0
+  },
+  activeWorkers: 0,
+  currentWorkerAssignments: {},
+  startedAt: null,
+  updatedAt: new Date().toISOString(),
+  needsContinue: false
+};
+
+export function calculateStats(items: DomainItem[]): InspectionStats {
+  let completed = 0;
+  let pending = 0;
+  let inFlight = 0;
+  let retryRequired = 0;
+  let sslYes = 0;
+  let sslNo = 0;
+  let websiteYes = 0;
+  let websiteNo = 0;
+  let bothYes = 0;
+  let whoisFound = 0;
+
+  for (const item of items) {
+    if (item.status === 'completed') completed++;
+    else if (item.status === 'pending') pending++;
+    else if (item.status === 'checking') inFlight++;
+    else if (item.status === 'retry_required') retryRequired++;
+
+    if (item.ssl.status === 'YES') sslYes++;
+    else if (item.ssl.status === 'NO') sslNo++;
+
+    if (item.website.status === 'YES') websiteYes++;
+    else if (item.website.status === 'NO') websiteNo++;
+
+    if (item.ssl.status === 'YES' && item.website.status === 'YES') {
+      bothYes++;
+    }
+
+    if (item.whois.status === 'FOUND') {
+      whoisFound++;
+    }
+  }
+
+  const total = items.length;
+  const percentComplete = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+  return {
+    total,
+    completed,
+    pending,
+    inFlight,
+    retryRequired,
+    sslYes,
+    sslNo,
+    websiteYes,
+    websiteNo,
+    bothYes,
+    whoisFound,
+    percentComplete
+  };
 }
 
-class PostgresJobStore implements JobStore {
-  private pool: pg.Pool;
-  private tableInitialized = false;
+// Global fallback for in-memory execution during local development
+declare global {
+  // eslint-disable-next-line no-var
+  var __DOMAIN_INSPECTION_MEMORY_STATE__: InspectionState | undefined;
+}
 
-  constructor(connectionString: string) {
-    this.pool = new Pool({
-      connectionString,
-      ssl: connectionString.includes('localhost') ? false : { rejectUnauthorized: false }
-    });
-  }
+const kvUrl = process.env.KV_REST_API_URL;
+const kvToken = process.env.KV_REST_API_TOKEN;
 
-  private async ensureTable() {
-    if (this.tableInitialized) return;
+const kvClient = kvUrl && kvToken ? createClient({ url: kvUrl, token: kvToken }) : null;
+
+if (!globalThis.__DOMAIN_INSPECTION_MEMORY_STATE__) {
+  globalThis.__DOMAIN_INSPECTION_MEMORY_STATE__ = JSON.parse(JSON.stringify(DEFAULT_STATE));
+}
+
+export async function getState(): Promise<InspectionState> {
+  if (kvClient) {
     try {
-      await this.pool.query(`
-        CREATE TABLE IF NOT EXISTS domain_inspector_jobs (
-          id VARCHAR(255) PRIMARY KEY,
-          state JSONB NOT NULL,
-          updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-        );
-      `);
-      this.tableInitialized = true;
+      const data = await kvClient.get<InspectionState>(STATE_KEY);
+      if (data && typeof data === 'object') {
+        return data;
+      }
     } catch (err) {
-      console.error('[PostgresJobStore] Failed to ensure table exists:', err);
+      console.error('[jobStore] Error reading from Vercel KV, falling back to memory:', err);
     }
   }
 
-  async getJob(jobId: string = 'current'): Promise<InspectionState | null> {
-    await this.ensureTable();
-    try {
-      const res = await this.pool.query(
-        'SELECT state FROM domain_inspector_jobs WHERE id = $1 LIMIT 1',
-        [jobId]
-      );
-      if (res.rows.length === 0) return null;
-      return res.rows[0].state as InspectionState;
-    } catch (err) {
-      console.error('[PostgresJobStore] Error in getJob:', err);
-      return null;
-    }
-  }
+  return JSON.parse(JSON.stringify(globalThis.__DOMAIN_INSPECTION_MEMORY_STATE__ || DEFAULT_STATE));
+}
 
-  async saveJob(jobId: string = 'current', state: InspectionState): Promise<void> {
-    await this.ensureTable();
-    try {
-      await this.pool.query(
-        `INSERT INTO domain_inspector_jobs (id, state, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (id) DO UPDATE SET state = $2, updated_at = NOW()`,
-        [jobId, JSON.stringify(state)]
-      );
-    } catch (err) {
-      console.error('[PostgresJobStore] Error in saveJob:', err);
-    }
-  }
+export async function setState(state: InspectionState): Promise<void> {
+  state.updatedAt = new Date().toISOString();
+  state.stats = calculateStats(state.items);
 
-  async listJobs(): Promise<Array<{ id: string; updatedAt: string }>> {
-    await this.ensureTable();
+  // Always update in-memory cache
+  globalThis.__DOMAIN_INSPECTION_MEMORY_STATE__ = JSON.parse(JSON.stringify(state));
+
+  if (kvClient) {
     try {
-      const res = await this.pool.query(
-        'SELECT id, updated_at FROM domain_inspector_jobs ORDER BY updated_at DESC LIMIT 50'
-      );
-      return res.rows.map((r: any) => ({
-        id: r.id,
-        updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : new Date().toISOString()
-      }));
+      await kvClient.set(STATE_KEY, state);
     } catch (err) {
-      console.error('[PostgresJobStore] Error in listJobs:', err);
-      return [];
+      console.error('[jobStore] Error writing to Vercel KV:', err);
     }
   }
 }
 
-class MemoryJobStore implements JobStore {
-  private jobs: Map<string, { state: InspectionState; updatedAt: string }> = new Map();
-
-  async getJob(jobId: string = 'current'): Promise<InspectionState | null> {
-    const entry = this.jobs.get(jobId);
-    return entry ? JSON.parse(JSON.stringify(entry.state)) : null;
-  }
-
-  async saveJob(jobId: string = 'current', state: InspectionState): Promise<void> {
-    this.jobs.set(jobId, {
-      state: JSON.parse(JSON.stringify(state)),
-      updatedAt: new Date().toISOString()
-    });
-  }
-
-  async listJobs(): Promise<Array<{ id: string; updatedAt: string }>> {
-    return Array.from(this.jobs.entries()).map(([id, val]) => ({
-      id,
-      updatedAt: val.updatedAt
-    }));
-  }
+export async function getItem(id: string): Promise<DomainItem | undefined> {
+  const state = await getState();
+  return state.items.find((it) => it.id === id);
 }
 
-// Global singleton instance
-const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+let updateQueue: Promise<void> = Promise.resolve();
 
-export const jobStore: JobStore = databaseUrl
-  ? new PostgresJobStore(databaseUrl)
-  : new MemoryJobStore();
+export async function setItem(item: DomainItem): Promise<void> {
+  const op = async () => {
+    const state = await getState();
+    const idx = state.items.findIndex((it) => it.id === item.id);
+    if (idx !== -1) {
+      state.items[idx] = item;
+    } else {
+      state.items.push(item);
+    }
+    await setState(state);
+  };
+
+  updateQueue = updateQueue.then(op, op);
+  return updateQueue;
+}
+
+export async function listItems(): Promise<DomainItem[]> {
+  const state = await getState();
+  return [...state.items].sort((a, b) => a.originalIndex - b.originalIndex);
+}
+
+export async function clearAll(): Promise<void> {
+  const fresh = JSON.parse(JSON.stringify(DEFAULT_STATE));
+  await setState(fresh);
+}
+
+// Interface for backward-compatibility with existing jobStore callers
+export const jobStore = {
+  getState,
+  setState,
+  getItem,
+  setItem,
+  listItems,
+  clearAll,
+  calculateStats,
+  getJob: async (_jobId?: string) => getState(),
+  saveJob: async (_jobId: string, state: InspectionState) => setState(state),
+  listJobs: async () => [{ id: 'current', updatedAt: (await getState()).updatedAt }]
+};
+
+export default jobStore;

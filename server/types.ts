@@ -114,4 +114,6 @@ export interface InspectionState {
   currentWorkerAssignments: Record<number, string>; // workerId -> domain
   startedAt?: string | null;
   updatedAt: string;
+  needsContinue?: boolean;
 }
+

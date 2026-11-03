@@ -114,6 +114,7 @@ export interface InspectionState {
   currentWorkerAssignments: Record<number, string>;
   startedAt?: string | null;
   updatedAt: string;
+  needsContinue?: boolean;
 }
 
 export interface ValidationSummary {
