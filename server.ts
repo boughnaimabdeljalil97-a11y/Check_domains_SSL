@@ -34,18 +34,20 @@ async function startServer() {
   });
 
   // API Routes
-  app.get('/api/status', (_req: Request, res: Response) => {
-    res.json(jobManager.getFullState());
+  app.get('/api/status', async (_req: Request, res: Response) => {
+    const state = await jobManager.tickOrStatus();
+    res.json(state);
   });
 
-  app.get('/api/events', (req: Request, res: Response) => {
+  app.get('/api/events', async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
     // Send initial snapshot immediately
-    res.write(`data: ${JSON.stringify({ event: 'initial_state', state: jobManager.getFullState() })}\n\n`);
+    const initialState = await jobManager.getFullState();
+    res.write(`data: ${JSON.stringify({ event: 'initial_state', state: initialState })}\n\n`);
 
     sseClients.add(res);
 
@@ -87,42 +89,43 @@ async function startServer() {
     });
   });
 
-  app.post('/api/start', (req: Request, res: Response) => {
+  app.post('/api/start', async (req: Request, res: Response) => {
     const { domains, settings } = req.body;
     if (!domains || (!Array.isArray(domains) && typeof domains !== 'string')) {
       return res.status(400).json({ error: 'Domains must be an array of strings or a multiline string' });
     }
 
-    const state = jobManager.startJob(domains, settings);
+    const state = await jobManager.startJob(domains, settings);
     res.json({ success: true, state });
   });
 
-  app.post('/api/pause', (_req: Request, res: Response) => {
-    const state = jobManager.pauseJob();
+  app.post('/api/pause', async (_req: Request, res: Response) => {
+    const state = await jobManager.pauseJob();
     res.json({ success: true, state });
   });
 
-  app.post('/api/resume', (_req: Request, res: Response) => {
-    const state = jobManager.resumeJob();
+  app.post('/api/resume', async (_req: Request, res: Response) => {
+    const state = await jobManager.resumeJob();
     res.json({ success: true, state });
   });
 
-  app.post('/api/stop', (_req: Request, res: Response) => {
-    const state = jobManager.stopJob();
+  app.post('/api/stop', async (_req: Request, res: Response) => {
+    const state = await jobManager.stopJob();
     res.json({ success: true, state });
   });
 
-  app.post('/api/retry', (req: Request, res: Response) => {
+  app.post('/api/retry', async (req: Request, res: Response) => {
     const { id, allIssues } = req.body;
     if (allIssues) {
-      const state = jobManager.retryAllIssues();
+      const state = await jobManager.retryAllIssues();
       return res.json({ success: true, state });
     }
     if (!id) {
       return res.status(400).json({ error: 'Missing item id' });
     }
-    const success = jobManager.retryItem(id);
-    res.json({ success, state: jobManager.getFullState() });
+    const success = await jobManager.retryItem(id);
+    const state = await jobManager.getFullState();
+    res.json({ success, state });
   });
 
   app.post('/api/recheck-missing-whois', async (_req: Request, res: Response) => {
@@ -130,16 +133,16 @@ async function startServer() {
     res.json({ success: true, state });
   });
 
-  app.get('/api/export/csv', (_req: Request, res: Response) => {
-    const csvData = jobManager.exportToCsv();
+  app.get('/api/export/csv', async (_req: Request, res: Response) => {
+    const csvData = await jobManager.exportToCsv();
     const filename = `domain-inspector-${new Date().toISOString().split('T')[0]}.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csvData);
   });
 
-  app.get('/api/export/xlsx', (_req: Request, res: Response) => {
-    const buffer = jobManager.exportToExcel();
+  app.get('/api/export/xlsx', async (_req: Request, res: Response) => {
+    const buffer = await jobManager.exportToExcel();
     const filename = `domain-inspector-${new Date().toISOString().split('T')[0]}.xlsx`;
     res.setHeader(
       'Content-Type',

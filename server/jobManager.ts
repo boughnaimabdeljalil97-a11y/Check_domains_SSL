@@ -11,93 +11,106 @@ import type {
 import { checkDomainSSL } from './sslChecker.js';
 import { checkDomainWebsite } from './websiteChecker.js';
 import { checkDomainWhois } from './whoisChecker.js';
+import { jobStore } from './jobStore.js';
+
+const DEFAULT_SETTINGS: CheckerSettings = {
+  workers: 4,
+  timeoutSeconds: 30,
+  maxRetries: 2,
+  enableSSL: true,
+  enableWebsite: true,
+  enableWhois: true,
+  whoisPacedDelayMs: 800
+};
+
+const DEFAULT_STATE: InspectionState = {
+  status: 'idle',
+  items: [],
+  settings: DEFAULT_SETTINGS,
+  stats: {
+    total: 0,
+    completed: 0,
+    pending: 0,
+    inFlight: 0,
+    retryRequired: 0,
+    sslYes: 0,
+    sslNo: 0,
+    websiteYes: 0,
+    websiteNo: 0,
+    bothYes: 0,
+    whoisFound: 0,
+    percentComplete: 0
+  },
+  activeWorkers: 0,
+  currentWorkerAssignments: {},
+  startedAt: null,
+  updatedAt: new Date().toISOString()
+};
 
 export class JobManager extends EventEmitter {
-  private items: Map<string, DomainItem> = new Map();
-  private queue: string[] = []; // Domain IDs waiting to be processed
-  private inFlightWorkers: Map<number, string> = new Map(); // workerId -> domainId
-  private stateStatus: 'idle' | 'running' | 'paused' | 'stopped' | 'completed' = 'idle';
-  private startedAt: string | null = null;
-  private settings: CheckerSettings = {
-    workers: 4,
-    timeoutSeconds: 30,
-    maxRetries: 2,
-    enableSSL: true,
-    enableWebsite: true,
-    enableWhois: true
-  };
+  private inMemoryState: InspectionState = JSON.parse(JSON.stringify(DEFAULT_STATE));
   private isProcessing = false;
 
   constructor() {
     super();
   }
 
-  public getFullState(): InspectionState {
-    const itemsArray = Array.from(this.items.values());
-    const stats = this.computeStats(itemsArray);
-
-    const workerAssignments: Record<number, string> = {};
-    for (const [wId, dId] of this.inFlightWorkers.entries()) {
-      const item = this.items.get(dId);
-      if (item) {
-        workerAssignments[wId] = item.domain;
-      }
+  public async getFullState(jobId: string = 'current'): Promise<InspectionState> {
+    const stored = await jobStore.getJob(jobId);
+    if (stored) {
+      this.inMemoryState = stored;
+      return stored;
     }
+    return this.inMemoryState;
+  }
 
-    return {
-      status: this.stateStatus,
-      items: itemsArray,
-      settings: { ...this.settings },
-      stats,
-      activeWorkers: this.inFlightWorkers.size,
-      currentWorkerAssignments: workerAssignments,
-      startedAt: this.startedAt,
-      updatedAt: new Date().toISOString()
+  public getFullStateSync(): InspectionState {
+    return this.inMemoryState;
+  }
+
+  public async saveState(state: InspectionState, jobId: string = 'current'): Promise<void> {
+    this.inMemoryState = state;
+    state.updatedAt = new Date().toISOString();
+    state.stats = this.computeStats(state.items);
+    await jobStore.saveJob(jobId, state);
+    this.emit('update', {
+      event: 'state_updated',
+      state
+    });
+  }
+
+  public async startJob(
+    domains: string[] | string,
+    customSettings?: Partial<CheckerSettings>,
+    jobId: string = 'current'
+  ): Promise<InspectionState> {
+    const settings: CheckerSettings = {
+      ...DEFAULT_SETTINGS,
+      ...this.inMemoryState.settings,
+      ...customSettings
     };
-  }
 
-  public isStopped(): boolean {
-    return (this.stateStatus as string) === 'stopped';
-  }
-
-  public isRunning(): boolean {
-    return (this.stateStatus as string) === 'running';
-  }
-
-  public startJob(domains: string[] | string, customSettings?: Partial<CheckerSettings>): InspectionState {
-    if (customSettings) {
-      this.settings = { ...this.settings, ...customSettings };
-    }
-
-    // Clear previous state
-    this.items.clear();
-    this.queue = [];
-    this.inFlightWorkers.clear();
-    this.stateStatus = 'running';
-    this.startedAt = new Date().toISOString();
-
-    // Parse and normalize input domains, preserving original input order
     const normalizedDomains = this.parseInputDomains(domains);
 
-    normalizedDomains.forEach((domain, index) => {
+    const items: DomainItem[] = normalizedDomains.map((domain, index) => {
       const id = crypto.randomUUID();
-      const item: DomainItem = {
+      return {
         id,
         domain,
         cleanDomain: domain,
-        originalIndex: index + 1, // 1-based permanent order
+        originalIndex: index + 1,
         status: 'pending',
         currentStep: 'idle',
         currentWorkerId: null,
         ssl: {
-          status: this.settings.enableSSL ? 'CHECKING' : 'UNKNOWN',
+          status: settings.enableSSL ? 'CHECKING' : 'UNKNOWN',
           valid: false,
-          reason: this.settings.enableSSL ? 'Queued' : 'SSL check disabled in settings'
+          reason: settings.enableSSL ? 'Queued' : 'SSL check disabled in settings'
         },
         website: {
-          status: this.settings.enableWebsite ? 'CHECKING' : 'UNKNOWN',
+          status: settings.enableWebsite ? 'CHECKING' : 'UNKNOWN',
           available: false,
-          reason: this.settings.enableWebsite ? 'Queued' : 'Website check disabled in settings',
+          reason: settings.enableWebsite ? 'Queued' : 'Website check disabled in settings',
           statusCode: null,
           finalUrl: `https://${domain}`,
           title: '',
@@ -105,7 +118,7 @@ export class JobManager extends EventEmitter {
           loadTimeMs: 0
         },
         whois: {
-          status: this.settings.enableWhois ? 'CHECKING' : 'SKIPPED',
+          status: settings.enableWhois ? 'CHECKING' : 'SKIPPED',
           registeredOn: null,
           updatedOn: null,
           expiresOn: null,
@@ -113,10 +126,10 @@ export class JobManager extends EventEmitter {
           domainStatus: [],
           nameservers: [],
           rawSummary: null,
-          source: this.settings.enableWhois ? 'none' : 'skipped'
+          source: settings.enableWhois ? 'none' : 'skipped'
         },
         retries: 0,
-        maxRetries: this.settings.maxRetries,
+        maxRetries: settings.maxRetries,
         logs: [
           {
             step: 'system',
@@ -126,37 +139,73 @@ export class JobManager extends EventEmitter {
           }
         ]
       };
-
-      this.items.set(id, item);
-      this.queue.push(id);
     });
 
-    this.emitStateChange('job_started');
-    this.scheduleWorkers();
-    return this.getFullState();
-  }
+    const newState: InspectionState = {
+      status: items.length > 0 ? 'running' : 'completed',
+      items,
+      settings,
+      stats: this.computeStats(items),
+      activeWorkers: 0,
+      currentWorkerAssignments: {},
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
 
-  public pauseJob(): InspectionState {
-    if (this.stateStatus === 'running') {
-      this.stateStatus = 'paused';
-      this.emitStateChange('job_paused');
+    await this.saveState(newState, jobId);
+
+    // Process first batch inline so progress starts immediately
+    if (items.length > 0) {
+      await this.processNextBatch(jobId);
     }
-    return this.getFullState();
+
+    return this.getFullState(jobId);
   }
 
-  public resumeJob(): InspectionState {
-    if (this.stateStatus === 'paused') {
-      this.stateStatus = 'running';
-      this.emitStateChange('job_resumed');
-      this.scheduleWorkers();
+  /**
+   * Heartbeat / Tick: called on every /api/status request
+   * If job is running, executes the next batch of pending domains and saves state.
+   */
+  public async tickOrStatus(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    if (state.status === 'running') {
+      const hasPending = state.items.some((it) => it.status === 'pending');
+      if (hasPending && !this.isProcessing) {
+        await this.processNextBatch(jobId);
+      } else if (!hasPending && state.activeWorkers === 0) {
+        state.status = 'completed';
+        await this.saveState(state, jobId);
+      }
     }
-    return this.getFullState();
+    return this.getFullState(jobId);
   }
 
-  public stopJob(): InspectionState {
-    this.stateStatus = 'stopped';
-    this.queue = []; // Empty waiting queue
-    for (const item of this.items.values()) {
+  public async pauseJob(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    if (state.status === 'running') {
+      state.status = 'paused';
+      await this.saveState(state, jobId);
+    }
+    return state;
+  }
+
+  public async resumeJob(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    if (state.status === 'paused') {
+      state.status = 'running';
+      await this.saveState(state, jobId);
+      await this.processNextBatch(jobId);
+    }
+    return this.getFullState(jobId);
+  }
+
+  public async stopJob(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    state.status = 'stopped';
+    state.activeWorkers = 0;
+    state.currentWorkerAssignments = {};
+
+    for (const item of state.items) {
       if (item.status === 'pending') {
         item.status = 'failed';
         item.currentStep = 'done';
@@ -165,12 +214,14 @@ export class JobManager extends EventEmitter {
         if (item.whois.status === 'CHECKING') item.whois.status = 'NOT_FOUND';
       }
     }
-    this.emitStateChange('job_stopped');
-    return this.getFullState();
+
+    await this.saveState(state, jobId);
+    return state;
   }
 
-  public retryItem(itemId: string): boolean {
-    const item = this.items.get(itemId);
+  public async retryItem(itemId: string, jobId: string = 'current'): Promise<boolean> {
+    const state = await this.getFullState(jobId);
+    const item = state.items.find((i) => i.id === itemId);
     if (!item) return false;
 
     item.status = 'pending';
@@ -183,28 +234,28 @@ export class JobManager extends EventEmitter {
       type: 'info'
     });
 
-    if (this.settings.enableSSL) item.ssl.status = 'CHECKING';
-    if (this.settings.enableWebsite) item.website.status = 'CHECKING';
-    if (this.settings.enableWhois) item.whois.status = 'CHECKING';
+    if (state.settings.enableSSL) item.ssl.status = 'CHECKING';
+    if (state.settings.enableWebsite) item.website.status = 'CHECKING';
+    if (state.settings.enableWhois) item.whois.status = 'CHECKING';
 
-    this.queue.push(itemId);
-    if (this.stateStatus !== 'running') {
-      this.stateStatus = 'running';
-    }
-    this.emitStateChange('item_retry_queued', item);
-    this.scheduleWorkers();
+    state.status = 'running';
+    await this.saveState(state, jobId);
+    await this.processNextBatch(jobId);
     return true;
   }
 
-  public retryAllIssues(): InspectionState {
-    for (const item of this.items.values()) {
+  public async retryAllIssues(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    let queuedCount = 0;
+
+    for (const item of state.items) {
       const isIssue =
         item.status === 'failed' ||
         item.status === 'retry_required' ||
         item.website.status === 'UNKNOWN' ||
         item.ssl.status === 'UNKNOWN';
 
-      if (isIssue && !this.queue.includes(item.id) && !Array.from(this.inFlightWorkers.values()).includes(item.id)) {
+      if (isIssue) {
         item.status = 'pending';
         item.currentStep = 'idle';
         item.retries += 1;
@@ -214,122 +265,120 @@ export class JobManager extends EventEmitter {
           message: `Batch retry requested (Attempt ${item.retries + 1})`,
           type: 'info'
         });
-        if (this.settings.enableSSL) item.ssl.status = 'CHECKING';
-        if (this.settings.enableWebsite) item.website.status = 'CHECKING';
-        if (this.settings.enableWhois) item.whois.status = 'CHECKING';
-        this.queue.push(item.id);
+        if (state.settings.enableSSL) item.ssl.status = 'CHECKING';
+        if (state.settings.enableWebsite) item.website.status = 'CHECKING';
+        if (state.settings.enableWhois) item.whois.status = 'CHECKING';
+        queuedCount++;
       }
     }
 
-    if (this.stateStatus !== 'running' && this.queue.length > 0) {
-      this.stateStatus = 'running';
+    if (queuedCount > 0) {
+      state.status = 'running';
+      await this.saveState(state, jobId);
+      await this.processNextBatch(jobId);
     }
-    this.emitStateChange('batch_retry_started');
-    this.scheduleWorkers();
-    return this.getFullState();
+
+    return this.getFullState(jobId);
   }
 
-  /**
-   * Slowly and reliably re-checks only domains that currently lack registration dates,
-   * with inter-request spacing and automatic multi-channel retries until dates appear.
-   */
-  public async recheckMissingDates(): Promise<InspectionState> {
-    const missingItems = Array.from(this.items.values()).filter(
+  public async recheckMissingDates(jobId: string = 'current'): Promise<InspectionState> {
+    const state = await this.getFullState(jobId);
+    const missingItems = state.items.filter(
       (it) => it.whois.status !== 'FOUND' || !it.whois.registeredOn
     );
 
-    if (missingItems.length === 0) return this.getFullState();
+    if (missingItems.length === 0) return state;
 
-    // Mark items as checking in WHOIS
-    for (const item of missingItems) {
+    // Take next batch of missing items (up to 4 at a time with pacing)
+    const batch = missingItems.slice(0, 4);
+    const paceMs = Math.max(state.settings.whoisPacedDelayMs || 800, 400);
+
+    for (const item of batch) {
       item.whois.status = 'CHECKING';
-      this.log(item, 'whois', 'Paced re-check initiated for missing registration dates...', 'info');
-    }
-    this.emitStateChange('whois_recheck_started');
-
-    // Run sequentially with controlled pacing
-    (async () => {
-      const paceMs = Math.max(this.settings.whoisPacedDelayMs || 1000, 800);
-      for (const item of missingItems) {
-        if (this.isStopped()) break;
-
-        try {
-          const res = await checkDomainWhois(item.cleanDomain, {
-            timeoutMs: 12000,
-            pacedDelayMs: paceMs,
-            maxAttempts: 3,
-            onRetry: (attempt, msg) => {
-              this.log(item, 'whois', `Retry #${attempt}: ${msg}`, 'info');
-              this.emitStateChange('item_updated', item);
-            }
-          });
-          item.whois = res;
-
-          const isSuccess = res.status === 'FOUND' && res.registeredOn;
-          this.log(
-            item,
-            'whois',
-            `Re-check result: ${res.status} (${res.registrar || 'N/A'} | ${res.registeredOn || 'Unavailable'})`,
-            isSuccess ? 'success' : 'warn'
-          );
-        } catch (err: any) {
-          this.log(item, 'whois', `Re-check failed: ${err.message}`, 'error');
-        }
-
-        this.emitStateChange('item_updated', item);
+      try {
+        const res = await checkDomainWhois(item.cleanDomain, {
+          timeoutMs: 12000,
+          pacedDelayMs: paceMs,
+          maxAttempts: 3
+        });
+        item.whois = res;
+        this.log(
+          item,
+          'whois',
+          `Re-check result: ${res.status} (${res.registrar || 'N/A'} | ${res.registeredOn || 'Unavailable'})`,
+          res.status === 'FOUND' && res.registeredOn ? 'success' : 'warn'
+        );
+      } catch (err: any) {
+        this.log(item, 'whois', `Re-check error: ${err.message}`, 'error');
       }
-      this.emitStateChange('whois_recheck_completed');
-    })();
+    }
 
-    return this.getFullState();
+    await this.saveState(state, jobId);
+    return this.getFullState(jobId);
   }
 
   /**
-   * Worker loop: fills available worker slots up to settings.workers.
-   * Dispatches independent domains to workers.
+   * Dispatches the next batch of pending domains adhering to configured parallel workers.
+   * Concurrently processes domains across workers, while keeping steps 1-7 strictly sequential per domain.
    */
-  private scheduleWorkers() {
-    if (this.stateStatus !== 'running') return;
+  public async processNextBatch(jobId: string = 'current'): Promise<void> {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
 
-    const maxWorkers = Math.min(Math.max(this.settings.workers, 1), 8);
+    try {
+      const state = await this.getFullState(jobId);
+      if (state.status !== 'running') return;
 
-    // Find free worker slots 1..maxWorkers
-    for (let wId = 1; wId <= maxWorkers; wId++) {
-      if (this.queue.length === 0) break;
-      if (this.inFlightWorkers.has(wId)) continue; // Worker already busy
+      const pendingItems = state.items.filter((it) => it.status === 'pending');
+      if (pendingItems.length === 0) {
+        state.status = 'completed';
+        state.activeWorkers = 0;
+        state.currentWorkerAssignments = {};
+        await this.saveState(state, jobId);
+        return;
+      }
 
-      const nextDomainId = this.queue.shift();
-      if (!nextDomainId) break;
+      const maxWorkers = Math.min(Math.max(state.settings.workers || 4, 1), 8);
+      const batch = pendingItems.slice(0, maxWorkers);
 
-      const item = this.items.get(nextDomainId);
-      if (!item) continue;
+      // Assign in-flight workers
+      state.activeWorkers = batch.length;
+      state.currentWorkerAssignments = {};
+      batch.forEach((item, index) => {
+        const workerId = index + 1;
+        item.currentWorkerId = workerId;
+        item.status = 'checking';
+        item.startedAt = item.startedAt || new Date().toISOString();
+        state.currentWorkerAssignments[workerId] = item.domain;
+      });
 
-      this.inFlightWorkers.set(wId, nextDomainId);
-      item.currentWorkerId = wId;
-      item.status = 'checking';
-      item.startedAt = item.startedAt || new Date().toISOString();
+      await this.saveState(state, jobId);
 
-      this.emitStateChange('worker_assigned', { workerId: wId, domain: item.domain });
+      // Process batch domains in parallel using configured workers
+      await Promise.all(
+        batch.map((item, index) =>
+          this.processDomainSequential(item, index + 1, state.settings).catch((err) => {
+            this.log(item, 'system', `Unexpected worker error: ${err.message}`, 'error');
+            item.status = 'failed';
+          })
+        )
+      );
 
-      // Process domain through strict sequential 7-step pipeline
-      this.processDomainSequential(item, wId)
-        .catch((err) => {
-          this.log(item, 'system', `Unexpected worker error: ${err.message}`, 'error');
-          item.status = 'failed';
-        })
-        .finally(() => {
-          this.inFlightWorkers.delete(wId);
-          item.currentWorkerId = null;
+      // Free workers for finished batch
+      batch.forEach((item) => {
+        item.currentWorkerId = null;
+      });
+      state.activeWorkers = 0;
+      state.currentWorkerAssignments = {};
 
-          // Check if all queued and in-flight work is complete
-          if (this.queue.length === 0 && this.inFlightWorkers.size === 0) {
-            this.stateStatus = 'completed';
-            this.emitStateChange('job_completed');
-          } else {
-            // Keep dispatching remaining items
-            this.scheduleWorkers();
-          }
-        });
+      const remainingPending = state.items.filter((it) => it.status === 'pending');
+      if (remainingPending.length === 0) {
+        state.status = 'completed';
+      }
+
+      await this.saveState(state, jobId);
+    } finally {
+      this.isProcessing = false;
     }
   }
 
@@ -343,14 +392,17 @@ export class JobManager extends EventEmitter {
    * STEP 6 -> SAVE REGISTRATION INFORMATION
    * STEP 7 -> MARK DOMAIN AS COMPLETED
    */
-  private async processDomainSequential(item: DomainItem, workerId: number): Promise<void> {
-    const timeoutMs = this.settings.timeoutSeconds * 1000;
+  public async processDomainSequential(
+    item: DomainItem,
+    workerId: number,
+    settings: CheckerSettings
+  ): Promise<void> {
+    const timeoutMs = (settings.timeoutSeconds || 30) * 1000;
 
     // STEP 1 & 2: SSL CHECK & SAVE
-    if (this.settings.enableSSL) {
+    if (settings.enableSSL) {
       item.currentStep = 'ssl';
       this.log(item, 'ssl', `Worker #${workerId}: Starting TLS certificate check on port 443...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'ssl' });
 
       try {
         const sslRes = await checkDomainSSL(item.cleanDomain, { timeoutMs: Math.min(timeoutMs, 15000) });
@@ -367,18 +419,12 @@ export class JobManager extends EventEmitter {
         };
         this.log(item, 'ssl', `Worker #${workerId}: SSL Check error: ${sslErr.message}`, 'error');
       }
-
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'ssl' });
     }
 
-    // Check pause/stop between steps
-    if (this.isStopped()) return;
-
     // STEP 3 & 4: WEBSITE CHECK & SAVE
-    if (this.settings.enableWebsite) {
+    if (settings.enableWebsite) {
       item.currentStep = 'website';
       this.log(item, 'website', `Worker #${workerId}: Starting Website availability inspection...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'website' });
 
       try {
         const webRes = await checkDomainWebsite(item.cleanDomain, { timeoutMs });
@@ -401,27 +447,20 @@ export class JobManager extends EventEmitter {
         };
         this.log(item, 'website', `Worker #${workerId}: Website Check error: ${webErr.message}`, 'error');
       }
-
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'website' });
     }
 
-    // Check pause/stop between steps
-    if (this.isStopped()) return;
-
     // STEP 5 & 6: WHOIS / RDAP LOOKUP & SAVE
-    if (this.settings.enableWhois) {
+    if (settings.enableWhois) {
       item.currentStep = 'whois';
       this.log(item, 'whois', `Worker #${workerId}: Querying RDAP registration data...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'whois' });
 
       try {
         const whoisRes = await checkDomainWhois(item.cleanDomain, {
           timeoutMs: 12000,
-          pacedDelayMs: this.settings.whoisPacedDelayMs || 800,
+          pacedDelayMs: settings.whoisPacedDelayMs || 800,
           maxAttempts: 3,
           onRetry: (attempt, msg) => {
             this.log(item, 'whois', `Worker #${workerId} (Attempt ${attempt}): ${msg}`, 'info');
-            this.emitStateChange('item_updated', item);
           }
         });
         item.whois = whoisRes;
@@ -448,15 +487,12 @@ export class JobManager extends EventEmitter {
         };
         this.log(item, 'whois', `Worker #${workerId}: Registration check error: ${whoisErr.message}`, 'warn');
       }
-
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'whois' });
     }
 
     // STEP 7: MARK DOMAIN AS COMPLETED OR RETRY REQUIRED
     item.currentStep = 'done';
     item.completedAt = new Date().toISOString();
 
-    // If website status is UNKNOWN (e.g. temporary challenge or timeout) and retries remain, mark retry_required
     if (item.website.status === 'UNKNOWN' && item.retries < item.maxRetries) {
       item.status = 'retry_required';
       this.log(item, 'system', `Domain marked as Retry Required (${item.website.reason})`, 'warn');
@@ -464,24 +500,14 @@ export class JobManager extends EventEmitter {
       item.status = 'completed';
       this.log(item, 'system', `All inspection steps completed successfully`, 'success');
     }
-
-    this.emitStateChange('item_completed', item);
   }
 
-  private log(item: DomainItem, step: DomainLog['step'], message: string, type: DomainLog['type']) {
+  public log(item: DomainItem, step: DomainLog['step'], message: string, type: DomainLog['type']) {
     item.logs.push({
       step,
       timestamp: new Date().toISOString(),
       message,
       type
-    });
-  }
-
-  private emitStateChange(eventName: string, payload?: any) {
-    this.emit('update', {
-      event: eventName,
-      payload,
-      state: this.getFullState()
     });
   }
 
@@ -511,25 +537,16 @@ export class JobManager extends EventEmitter {
     if (!raw) return null;
     let s = raw.trim();
 
-    // Remove surrounding whitespace or quotes
     s = s.replace(/^["']|["']$/g, '').trim();
-
-    // If starts with http:// or https://, strip it
     s = s.replace(/^(?:https?:\/\/)/i, '');
-
-    // Strip path or port
     s = s.split('/')[0].split('?')[0].split('#')[0];
-    s = s.split(':')[0]; // strip port if present
-
+    s = s.split(':')[0];
     s = s.toLowerCase().trim();
 
-    // Reject spaces or invalid characters
     if (!s || s.includes(' ') || s.includes('@')) {
       return null;
     }
 
-    // Validate domain pattern (must have at least one dot, valid labels)
-    // Supports domains like takula.com, repro-tech.co.uk
     const domainRegex = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
     if (!domainRegex.test(s)) {
       return null;
@@ -538,10 +555,7 @@ export class JobManager extends EventEmitter {
     return s;
   }
 
-  /**
-   * Computes statistics across all domains
-   */
-  private computeStats(items: DomainItem[]): InspectionStats {
+  public computeStats(items: DomainItem[]): InspectionStats {
     let completed = 0;
     let pending = 0;
     let inFlight = 0;
@@ -590,12 +604,13 @@ export class JobManager extends EventEmitter {
 
   /**
    * CRITICAL REQUIREMENT: PRESERVE ORIGINAL INPUT ORDER
-   * Assigns permanent originalIndex and sorts strictly by originalIndex before export!
+   * Sorts strictly by originalIndex before export!
    */
-  public getExportData(): Array<Record<string, any>> {
-    const items = Array.from(this.items.values());
+  public async getExportData(jobId: string = 'current'): Promise<Array<Record<string, any>>> {
+    const state = await this.getFullState(jobId);
+    const items = [...state.items];
 
-    // Sort strictly by originalIndex
+    // Sort strictly by permanent originalIndex
     items.sort((a, b) => a.originalIndex - b.originalIndex);
 
     return items.map((item) => ({
@@ -619,8 +634,8 @@ export class JobManager extends EventEmitter {
     }));
   }
 
-  public exportToCsv(): string {
-    const data = this.getExportData();
+  public async exportToCsv(jobId: string = 'current'): Promise<string> {
+    const data = await this.getExportData(jobId);
     if (data.length === 0) {
       return '#,Domain,Registered On,Updated On,Expires On,Registrar,SSL,SSL Reason,SSL Issuer,SSL Expiry,Days Until Expiry,Website,Website Reason,Final URL,HTTP Status,Load Time (ms),Completed At\n';
     }
@@ -638,11 +653,10 @@ export class JobManager extends EventEmitter {
     return [headerLine, ...rows].join('\r\n');
   }
 
-  public exportToExcel(): Buffer {
-    const data = this.getExportData();
+  public async exportToExcel(jobId: string = 'current'): Promise<Buffer> {
+    const data = await this.getExportData(jobId);
     const worksheet = XLSX.utils.json_to_sheet(data);
 
-    // Auto-fit column widths
     const colWidths = [
       { wch: 4 },  // #
       { wch: 25 }, // Domain
