@@ -130,8 +130,8 @@ export async function runFullTestSuite(): Promise<{
       'repro-tech.co.uk'
     ];
 
-    const state = await testManager.startJob(sampleInput);
-    const parsed = state.items.map((it: any) => it.domain);
+    const state = testManager.startJob(sampleInput);
+    const parsed = state.items.map((it) => it.domain);
 
     // Verify ordering
     const matchesOriginal =
@@ -140,7 +140,7 @@ export async function runFullTestSuite(): Promise<{
       parsed[1] === 'supporteasyjet.com' &&
       parsed[2] === 'repro-tech.co.uk';
 
-    const exportRows = await testManager.getExportData();
+    const exportRows = testManager.getExportData();
     const exportOrderMaintained =
       exportRows.length === 3 &&
       exportRows[0].Domain === 'carcrashkits.com' &&
@@ -162,7 +162,7 @@ export async function runFullTestSuite(): Promise<{
   {
     const start = Date.now();
     const testManager = new JobManager();
-    const state = await testManager.startJob(['example.com'], {
+    const state = testManager.startJob(['example.com'], {
       workers: 1,
       enableSSL: true,
       enableWebsite: true,
@@ -173,7 +173,7 @@ export async function runFullTestSuite(): Promise<{
     const initialItem = state.items[0];
     const sequenceOk = initialItem && initialItem.originalIndex === 1;
 
-    await testManager.stopJob();
+    testManager.stopJob();
 
     record(
       'Execution',

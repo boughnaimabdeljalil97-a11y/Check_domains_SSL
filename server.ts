@@ -4,14 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-import {
-  jobManager,
-  inspectDomains,
-  recheckWhoisOnly,
-  exportToCsv,
-  exportToExcel,
-  DEFAULT_STATE
-} from './server/jobManager.js';
+import { jobManager } from './server/jobManager.js';
 import { runFullTestSuite } from './server/testSuite.js';
 
 dotenv.config();
@@ -26,23 +19,45 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
-  // API Routes
-  app.get('/api/status', async (_req: Request, res: Response) => {
-    res.json(DEFAULT_STATE);
+  // SSE client connections
+  const sseClients = new Set<Response>();
+
+  jobManager.on('update', (data) => {
+    const payload = `data: ${JSON.stringify(data)}\n\n`;
+    for (const res of sseClients) {
+      try {
+        res.write(payload);
+      } catch {
+        sseClients.delete(res);
+      }
+    }
   });
 
-  app.get('/api/events', async (_req: Request, res: Response) => {
+  // API Routes
+  app.get('/api/status', (_req: Request, res: Response) => {
+    res.json(jobManager.getFullState());
+  });
+
+  app.get('/api/events', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.write('data: {"event":"connected","message":"stateless"}\n\n');
-    res.end();
+    res.flushHeaders?.();
+
+    // Send initial snapshot immediately
+    res.write(`data: ${JSON.stringify({ event: 'initial_state', state: jobManager.getFullState() })}\n\n`);
+
+    sseClients.add(res);
+
+    req.on('close', () => {
+      sseClients.delete(res);
+    });
   });
 
   app.post('/api/validate-domains', (req: Request, res: Response) => {
     const rawInput = req.body.domains;
     const lines = typeof rawInput === 'string' ? rawInput.split(/\r?\n/) : Array.isArray(rawInput) ? rawInput : [];
-
+    
     const valid: string[] = [];
     const invalid: string[] = [];
     const duplicates: string[] = [];
@@ -72,64 +87,59 @@ async function startServer() {
     });
   });
 
-  app.post('/api/start', async (req: Request, res: Response) => {
+  app.post('/api/start', (req: Request, res: Response) => {
     const { domains, settings } = req.body;
     if (!domains || (!Array.isArray(domains) && typeof domains !== 'string')) {
       return res.status(400).json({ error: 'Domains must be an array of strings or a multiline string' });
     }
 
-    const state = await inspectDomains(domains, settings);
+    const state = jobManager.startJob(domains, settings);
     res.json({ success: true, state });
   });
 
-  app.post('/api/pause', async (_req: Request, res: Response) => {
-    res.json({ success: true, message: 'Paused' });
-  });
-
-  app.post('/api/resume', async (_req: Request, res: Response) => {
-    res.json({ success: true, message: 'Resumed' });
-  });
-
-  app.post('/api/stop', async (_req: Request, res: Response) => {
-    res.json({ success: true, message: 'Stopped' });
-  });
-
-  app.post('/api/retry', async (req: Request, res: Response) => {
-    const { domains, domain, settings } = req.body;
-    const targetDomains = domains || (domain ? [domain] : []);
-    if (targetDomains.length > 0) {
-      const state = await inspectDomains(targetDomains, settings);
-      return res.json({ success: true, items: state.items, state });
-    }
-    const state = await jobManager.retryAllIssues();
+  app.post('/api/pause', (_req: Request, res: Response) => {
+    const state = jobManager.pauseJob();
     res.json({ success: true, state });
   });
 
-  app.post('/api/recheck-missing-whois', async (req: Request, res: Response) => {
-    const { domains, domain, settings } = req.body;
-    const targetDomains = domains || (domain ? [domain] : []);
-    if (targetDomains.length > 0) {
-      const results = await recheckWhoisOnly(targetDomains, settings);
-      return res.json({ success: true, results });
+  app.post('/api/resume', (_req: Request, res: Response) => {
+    const state = jobManager.resumeJob();
+    res.json({ success: true, state });
+  });
+
+  app.post('/api/stop', (_req: Request, res: Response) => {
+    const state = jobManager.stopJob();
+    res.json({ success: true, state });
+  });
+
+  app.post('/api/retry', (req: Request, res: Response) => {
+    const { id, allIssues } = req.body;
+    if (allIssues) {
+      const state = jobManager.retryAllIssues();
+      return res.json({ success: true, state });
     }
+    if (!id) {
+      return res.status(400).json({ error: 'Missing item id' });
+    }
+    const success = jobManager.retryItem(id);
+    res.json({ success, state: jobManager.getFullState() });
+  });
+
+  app.post('/api/recheck-missing-whois', async (_req: Request, res: Response) => {
     const state = await jobManager.recheckMissingDates();
     res.json({ success: true, state });
   });
 
-  const handleExportCsv = (req: Request, res: Response) => {
-    const items = req.body?.items || [];
-    const csvData = exportToCsv(items);
+  app.get('/api/export/csv', (_req: Request, res: Response) => {
+    const csvData = jobManager.exportToCsv();
     const filename = `domain-inspector-${new Date().toISOString().split('T')[0]}.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csvData);
-  };
-  app.get('/api/export/csv', handleExportCsv);
-  app.post('/api/export/csv', handleExportCsv);
+  });
 
-  const handleExportXlsx = (req: Request, res: Response) => {
-    const items = req.body?.items || [];
-    const buffer = exportToExcel(items);
+  app.get('/api/export/xlsx', (_req: Request, res: Response) => {
+    const buffer = jobManager.exportToExcel();
     const filename = `domain-inspector-${new Date().toISOString().split('T')[0]}.xlsx`;
     res.setHeader(
       'Content-Type',
@@ -137,9 +147,7 @@ async function startServer() {
     );
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(buffer);
-  };
-  app.get('/api/export/xlsx', handleExportXlsx);
-  app.post('/api/export/xlsx', handleExportXlsx);
+  });
 
   app.post('/api/test-suite/run', async (_req: Request, res: Response) => {
     try {
