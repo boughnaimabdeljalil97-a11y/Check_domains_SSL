@@ -110,50 +110,29 @@ function calculateStats(items: DomainItem[]): InspectionStats {
   };
 }
 
-function loadInitialState(): { state: InspectionState; settings: CheckerSettings; initialText: string } {
+function loadInitialState(): InspectionState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        const restoredSettings: CheckerSettings = {
-          ...DEFAULT_SETTINGS,
-          ...(parsed.settings || {})
-        };
-        const items: DomainItem[] = Array.isArray(parsed.items) ? parsed.items : [];
-        let status = parsed.status || 'idle';
-        if (status === 'running' || status === 'checking') {
-          status = 'stopped';
+      if (parsed && Array.isArray(parsed.items) && parsed.items.length > 0) {
+        if (parsed.status === 'running') {
+          parsed.status = 'stopped';
         }
-        const restoredState: InspectionState = {
-          status,
-          items,
-          settings: restoredSettings,
-          stats: items.length > 0 ? calculateStats(items) : DEFAULT_STATS,
-          activeWorkers: 0,
-          currentWorkerAssignments: {},
-          startedAt: parsed.startedAt || null,
-          updatedAt: parsed.updatedAt || new Date().toISOString()
-        };
-        const initialText =
-          items.length > 0
-            ? items.map((i) => i.domain || i.cleanDomain).join('\n')
-            : INITIAL_SAMPLE_DOMAINS;
-
-        return { state: restoredState, settings: restoredSettings, initialText };
+        parsed.stats = calculateStats(parsed.items);
+        return parsed;
       }
     }
   } catch (err) {
     console.warn('Could not restore state from localStorage:', err);
   }
-  return { state: DEFAULT_STATE, settings: DEFAULT_SETTINGS, initialText: INITIAL_SAMPLE_DOMAINS };
+  return DEFAULT_STATE;
 }
 
 export default function App() {
-  const initial = useRef(loadInitialState()).current;
-  const [domainText, setDomainText] = useState(initial.initialText);
-  const [settings, setSettings] = useState<CheckerSettings>(initial.settings);
-  const [state, setState] = useState<InspectionState>(initial.state);
+  const [domainText, setDomainText] = useState(INITIAL_SAMPLE_DOMAINS);
+  const [settings, setSettings] = useState<CheckerSettings>(DEFAULT_SETTINGS);
+  const [state, setState] = useState<InspectionState>(loadInitialState);
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [selectedDetailItem, setSelectedDetailItem] = useState<DomainItem | null>(null);
   const [isTestSuiteOpen, setIsTestSuiteOpen] = useState(false);
@@ -168,27 +147,14 @@ export default function App() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Keep settings synchronized in state
-  const handleSettingsChange = (newSettings: CheckerSettings) => {
-    setSettings(newSettings);
-    setState((prev) => ({
-      ...prev,
-      settings: newSettings
-    }));
-  };
-
-  // Save state to localStorage whenever items, stats, status, or settings change
+  // Save state to localStorage whenever it changes
   useEffect(() => {
     try {
-      const stateToPersist: InspectionState = {
-        ...state,
-        settings
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToPersist));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch (e) {
       console.warn('Failed to save inspection state to localStorage', e);
     }
-  }, [state, settings]);
+  }, [state]);
 
   // Client-side domain validation & normalization
   const validateInputDomains = useCallback((text: string) => {
@@ -230,7 +196,7 @@ export default function App() {
     validateInputDomains(domainText);
   }, [domainText, validateInputDomains]);
 
-  // 1. Start Checking
+  // Handlers
   const handleStart = async () => {
     if (validation.valid.length === 0) return;
 
@@ -240,7 +206,7 @@ export default function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Build immediate optimistic placeholder items for in-flight UI feedback
+    // Build immediate optimistic placeholder items
     const initialItems: DomainItem[] = validation.valid.map((domain, index) => ({
       id: `item-${index + 1}-${domain}`,
       domain,
@@ -311,184 +277,51 @@ export default function App() {
         signal: controller.signal
       });
 
-      if (!res.ok) {
-        throw new Error(`Server returned HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      const receivedState: InspectionState | undefined =
-        data?.state || (data?.items ? (data as InspectionState) : undefined);
-
-      if (receivedState && Array.isArray(receivedState.items)) {
-        const stats = receivedState.stats || calculateStats(receivedState.items);
-        const completedState: InspectionState = {
-          ...receivedState,
-          status: 'completed',
-          stats,
-          activeWorkers: 0,
-          settings: receivedState.settings || settings,
-          updatedAt: new Date().toISOString()
-        };
-
-        setState(completedState);
-
-        // Sync selected modal item
-        setSelectedDetailItem((prev) => {
-          if (!prev) return null;
-          return (
-            completedState.items.find(
-              (it: DomainItem) => it.id === prev.id || it.cleanDomain === prev.cleanDomain
-            ) || prev
-          );
-        });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.state) {
+          setState(data.state);
+          // Sync selected modal item
+          setSelectedDetailItem((prev) => {
+            if (!prev) return null;
+            return (
+              data.state.items.find(
+                (it: DomainItem) => it.id === prev.id || it.cleanDomain === prev.cleanDomain
+              ) || prev
+            );
+          });
+        }
       } else {
-        throw new Error('Response did not contain valid inspection items');
+        setState((prev) => ({ ...prev, status: 'stopped' }));
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        console.log('Inspection was stopped or paused by user');
+        console.log('Inspection stopped by user');
       } else {
-        console.error('Failed to start inspection:', err);
-        setState((prev) => ({
-          ...prev,
-          status: 'stopped',
-          activeWorkers: 0,
-          updatedAt: new Date().toISOString()
-        }));
+        console.error('Failed to start inspection', err);
+        setState((prev) => ({ ...prev, status: 'stopped' }));
       }
     } finally {
-      if (abortControllerRef.current === controller) {
-        abortControllerRef.current = null;
-      }
+      abortControllerRef.current = null;
     }
   };
 
-  // 4. Pause / Stop / Resume
   const handlePause = async () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
-    setState((prev) => {
-      const updated = prev.items.map((it) => {
-        if (it.status === 'checking') {
-          return {
-            ...it,
-            status: 'pending' as const
-          };
-        }
-        return it;
-      });
-      return {
-        ...prev,
-        status: 'paused',
-        items: updated,
-        activeWorkers: 0,
-        stats: calculateStats(updated),
-        updatedAt: new Date().toISOString()
-      };
-    });
+    setState((prev) => ({
+      ...prev,
+      status: 'paused',
+      activeWorkers: 0,
+      updatedAt: new Date().toISOString()
+    }));
     fetch('/api/pause', { method: 'POST' }).catch(() => {});
   };
 
   const handleResume = async () => {
-    const uncompleted = state.items.filter(
-      (it) => it.status === 'pending' || it.status === 'checking' || (state.status === 'paused' && it.status !== 'completed')
-    );
-    if (uncompleted.length === 0) return;
-
-    const uncompletedDomains = uncompleted.map((it) => it.cleanDomain || it.domain);
-
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    setState((prev) => {
-      const updated = prev.items.map((it) => {
-        const isTarget = uncompleted.some((u) => u.id === it.id || u.cleanDomain === it.cleanDomain);
-        if (isTarget) {
-          return {
-            ...it,
-            status: 'checking' as const,
-            currentStep: 'ssl' as const
-          };
-        }
-        return it;
-      });
-      return {
-        ...prev,
-        status: 'running',
-        items: updated,
-        activeWorkers: Math.min(settings.workers || 4, uncompleted.length),
-        stats: calculateStats(updated),
-        updatedAt: new Date().toISOString()
-      };
-    });
-
-    try {
-      const res = await fetch('/api/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domains: uncompletedDomains,
-          settings
-        }),
-        signal: controller.signal
-      });
-
-      if (!res.ok) {
-        throw new Error(`Server returned HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      const freshItems: DomainItem[] = data.state?.items || data.items || [];
-      const freshMap = new Map(freshItems.map((f) => [f.cleanDomain || f.domain, f]));
-
-      setState((prev) => {
-        const merged = prev.items.map((it) => {
-          const fresh = freshMap.get(it.cleanDomain || it.domain);
-          if (fresh) {
-            return {
-              ...fresh,
-              id: it.id,
-              originalIndex: it.originalIndex
-            };
-          }
-          return it;
-        });
-        const hasUnfinished = merged.some((it) => it.status === 'checking' || it.status === 'pending');
-        return {
-          ...prev,
-          status: hasUnfinished ? 'paused' : 'completed',
-          items: merged,
-          activeWorkers: 0,
-          stats: calculateStats(merged),
-          updatedAt: new Date().toISOString()
-        };
-      });
-
-      setSelectedDetailItem((prev) => {
-        if (!prev) return null;
-        const fresh = freshMap.get(prev.cleanDomain || prev.domain);
-        if (fresh) {
-          return { ...fresh, id: prev.id, originalIndex: prev.originalIndex };
-        }
-        return prev;
-      });
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        console.log('Resume aborted');
-      } else {
-        console.error('Failed to resume inspection', err);
-        setState((prev) => ({ ...prev, status: 'paused', activeWorkers: 0 }));
-      }
-    } finally {
-      if (abortControllerRef.current === controller) {
-        abortControllerRef.current = null;
-      }
-    }
+    handleStart();
   };
 
   const handleStop = async () => {
@@ -519,11 +352,10 @@ export default function App() {
     fetch('/api/stop', { method: 'POST' }).catch(() => {});
   };
 
-  // 5. Retry buttons
   const handleRecheckItem = async (item: DomainItem) => {
     setState((prev) => {
       const updated = prev.items.map((it) =>
-        it.id === item.id || it.cleanDomain === item.cleanDomain
+        it.id === item.id
           ? {
               ...it,
               status: 'checking' as const,
@@ -554,12 +386,7 @@ export default function App() {
                 ? { ...freshItem, id: it.id, originalIndex: it.originalIndex }
                 : it
             );
-            return {
-              ...prev,
-              items: updated,
-              stats: calculateStats(updated),
-              updatedAt: new Date().toISOString()
-            };
+            return { ...prev, items: updated, stats: calculateStats(updated) };
           });
           setSelectedDetailItem((prev) => {
             if (!prev || (prev.id !== item.id && prev.cleanDomain !== freshItem.cleanDomain)) {
@@ -602,13 +429,7 @@ export default function App() {
           website: { ...it.website, status: 'CHECKING' as const }
         };
       });
-      return {
-        ...prev,
-        status: 'running',
-        items: updated,
-        activeWorkers: Math.min(settings.workers || 4, issues.length),
-        stats: calculateStats(updated)
-      };
+      return { ...prev, items: updated, stats: calculateStats(updated) };
     });
 
     try {
@@ -620,40 +441,21 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         const newItems: DomainItem[] = data.items || data.state?.items || [];
-        const itemMap = new Map(newItems.map((n) => [n.cleanDomain || n.domain, n]));
+        const itemMap = new Map(newItems.map((n) => [n.cleanDomain, n]));
 
         setState((prev) => {
           const merged = prev.items.map((it) => {
-            const fresh = itemMap.get(it.cleanDomain || it.domain);
+            const fresh = itemMap.get(it.cleanDomain);
             if (fresh) {
               return { ...fresh, id: it.id, originalIndex: it.originalIndex };
             }
             return it;
           });
-          return {
-            ...prev,
-            status: 'completed',
-            activeWorkers: 0,
-            items: merged,
-            stats: calculateStats(merged),
-            updatedAt: new Date().toISOString()
-          };
+          return { ...prev, items: merged, stats: calculateStats(merged) };
         });
-
-        setSelectedDetailItem((prev) => {
-          if (!prev) return null;
-          const fresh = itemMap.get(prev.cleanDomain || prev.domain);
-          if (fresh) {
-            return { ...fresh, id: prev.id, originalIndex: prev.originalIndex };
-          }
-          return prev;
-        });
-      } else {
-        setState((prev) => ({ ...prev, status: 'completed', activeWorkers: 0 }));
       }
     } catch (err) {
       console.error('Failed to retry all issues', err);
-      setState((prev) => ({ ...prev, status: 'completed', activeWorkers: 0 }));
     }
   };
 
@@ -691,7 +493,7 @@ export default function App() {
 
         setState((prev) => {
           const merged = prev.items.map((it) => {
-            const whois = resultMap.get(it.cleanDomain || it.domain);
+            const whois = resultMap.get(it.cleanDomain);
             if (whois) {
               return {
                 ...it,
@@ -709,17 +511,12 @@ export default function App() {
             }
             return it;
           });
-          return {
-            ...prev,
-            items: merged,
-            stats: calculateStats(merged),
-            updatedAt: new Date().toISOString()
-          };
+          return { ...prev, items: merged, stats: calculateStats(merged) };
         });
 
         setSelectedDetailItem((prev) => {
           if (!prev) return null;
-          const whois = resultMap.get(prev.cleanDomain || prev.domain);
+          const whois = resultMap.get(prev.cleanDomain);
           if (whois) {
             return { ...prev, whois };
           }
@@ -788,7 +585,7 @@ export default function App() {
           <div className="lg:col-span-5">
             <SettingsPanel
               settings={settings}
-              onChange={handleSettingsChange}
+              onChange={setSettings}
               disabled={isChecking}
             />
           </div>
