@@ -57,17 +57,16 @@ export const DomainInput: React.FC<DomainInputProps> = ({
             <span>Load Sample</span>
           </button>
 
-          {value && (
-            <button
-              type="button"
-              onClick={onClear}
-              disabled={isChecking}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900/60 rounded-xl hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-colors disabled:opacity-50 shadow-2xs"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Clear</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={isChecking}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900/60 rounded-xl hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-colors disabled:opacity-50 shadow-2xs"
+            title="Clear domains, results, progress, and logs"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Clear</span>
+          </button>
         </div>
       </div>
 

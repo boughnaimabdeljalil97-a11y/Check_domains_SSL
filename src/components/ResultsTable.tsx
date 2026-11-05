@@ -32,6 +32,8 @@ interface ResultsTableProps {
   onDownloadCsv: () => void;
   onDownloadExcel: () => void;
   isChecking: boolean;
+  searchQuery?: string;
+  onSearchQueryChange?: (q: string) => void;
 }
 
 type SortField = 'originalIndex' | 'domain' | 'ssl' | 'website' | 'registeredOn' | 'updatedOn' | 'clusters';
@@ -48,9 +50,19 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
   onRecheckMissingDates,
   onDownloadCsv,
   onDownloadExcel,
-  isChecking
+  isChecking,
+  searchQuery: externalSearchQuery,
+  onSearchQueryChange
 }) => {
-  const [searchQuery, setSearchQuery] = useState('');
+  const [internalSearchQuery, setInternalSearchQuery] = useState('');
+  const searchQuery = externalSearchQuery !== undefined ? externalSearchQuery : internalSearchQuery;
+  const setSearchQuery = (q: string) => {
+    if (onSearchQueryChange) {
+      onSearchQueryChange(q);
+    } else {
+      setInternalSearchQuery(q);
+    }
+  };
   const [sortField, setSortField] = useState<SortField>('originalIndex');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 

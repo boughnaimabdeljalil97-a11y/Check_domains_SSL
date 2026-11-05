@@ -197,6 +197,19 @@ export class JobManager extends EventEmitter {
     return this.getFullState();
   }
 
+  public resetJob(): InspectionState {
+    // 1. Mark status stopped and clear queue to safely halt any pending work
+    this.stateStatus = 'stopped';
+    this.queue = [];
+    this.inFlightWorkers.clear();
+    this.items.clear();
+    this.startedAt = null;
+    this.stateStatus = 'idle';
+
+    this.emitStateChange('job_reset');
+    return this.getFullState();
+  }
+
   public retryItem(itemId: string): boolean {
     const item = this.items.get(itemId);
     if (!item) return false;

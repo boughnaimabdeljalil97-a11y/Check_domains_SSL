@@ -118,6 +118,11 @@ async function startServer() {
     res.json({ success: true, state });
   });
 
+  app.post('/api/reset', (_req: Request, res: Response) => {
+    const state = jobManager.resetJob();
+    res.json({ ok: true, state });
+  });
+
   app.post('/api/retry', (req: Request, res: Response) => {
     const { id, allIssues } = req.body;
     if (allIssues) {

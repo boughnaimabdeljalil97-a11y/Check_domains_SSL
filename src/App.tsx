@@ -33,6 +33,8 @@ carcrashkits.com
 supporteasyjet.com
 repro-tech.co.uk`;
 
+const STORAGE_KEY = 'inspector_settings_v1';
+
 const DEFAULT_SETTINGS: CheckerSettings = {
   workers: 4,
   timeoutSeconds: 30,
@@ -42,8 +44,47 @@ const DEFAULT_SETTINGS: CheckerSettings = {
   enableWhois: true,
   enableSpamhaus: false,
   spamhausUseProxy: false,
-  spamhausPacedDelayMs: 1000
+  spamhausPacedDelayMs: 1000,
+  whoisPacedDelayMs: 800,
+  spamhausProxies: []
 };
+
+function loadStoredSettings(): { settings: CheckerSettings; darkMode: boolean } {
+  let loadedSettings: CheckerSettings = { ...DEFAULT_SETTINGS };
+  let loadedDarkMode = false;
+
+  if (typeof window !== 'undefined') {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          loadedSettings = {
+            workers: typeof parsed.workers === 'number' ? parsed.workers : DEFAULT_SETTINGS.workers,
+            timeoutSeconds: typeof parsed.timeoutSeconds === 'number' ? parsed.timeoutSeconds : DEFAULT_SETTINGS.timeoutSeconds,
+            maxRetries: typeof parsed.maxRetries === 'number' ? parsed.maxRetries : DEFAULT_SETTINGS.maxRetries,
+            enableSSL: typeof parsed.enableSSL === 'boolean' ? parsed.enableSSL : DEFAULT_SETTINGS.enableSSL,
+            enableWebsite: typeof parsed.enableWebsite === 'boolean' ? parsed.enableWebsite : DEFAULT_SETTINGS.enableWebsite,
+            enableWhois: typeof parsed.enableWhois === 'boolean' ? parsed.enableWhois : DEFAULT_SETTINGS.enableWhois,
+            enableSpamhaus: typeof parsed.enableSpamhaus === 'boolean' ? parsed.enableSpamhaus : DEFAULT_SETTINGS.enableSpamhaus,
+            whoisPacedDelayMs: typeof parsed.whoisPacedDelayMs === 'number' ? parsed.whoisPacedDelayMs : DEFAULT_SETTINGS.whoisPacedDelayMs,
+            spamhausPacedDelayMs: typeof parsed.spamhausPacedDelayMs === 'number' ? parsed.spamhausPacedDelayMs : DEFAULT_SETTINGS.spamhausPacedDelayMs,
+            spamhausUseProxy: typeof parsed.spamhausUseProxy === 'boolean' ? parsed.spamhausUseProxy : DEFAULT_SETTINGS.spamhausUseProxy,
+            spamhausProxies: Array.isArray(parsed.spamhausProxies) ? parsed.spamhausProxies : [],
+            spamhausUsername: typeof parsed.spamhausUsername === 'string' ? parsed.spamhausUsername : undefined
+          };
+          if (typeof parsed.isDarkMode === 'boolean') {
+            loadedDarkMode = parsed.isDarkMode;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to parse inspector_settings_v1 from localStorage:', e);
+    }
+  }
+
+  return { settings: loadedSettings, darkMode: loadedDarkMode };
+}
 
 const DEFAULT_STATE: InspectionState = {
   status: 'idle',
@@ -79,14 +120,16 @@ interface Toast {
 }
 
 export default function App() {
-  const [domainText, setDomainText] = useState(INITIAL_SAMPLE_DOMAINS);
-  const [settings, setSettings] = useState<CheckerSettings>(DEFAULT_SETTINGS);
+  const initialConfig = useMemo(() => loadStoredSettings(), []);
+  const [domainText, setDomainText] = useState('');
+  const [settings, setSettings] = useState<CheckerSettings>(initialConfig.settings);
   const [state, setState] = useState<InspectionState>(DEFAULT_STATE);
   const [activeFilter, setActiveFilter] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedDetailItem, setSelectedDetailItem] = useState<DomainItem | null>(null);
   const [isTestSuiteOpen, setIsTestSuiteOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(initialConfig.darkMode);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [validation, setValidation] = useState<ValidationSummary>({
     valid: [],
@@ -105,7 +148,7 @@ export default function App() {
     }, 4000);
   }, []);
 
-  // Sync dark mode class on <html>
+  // Sync dark mode class on <html> and persist in localStorage
   useEffect(() => {
     if (isDarkMode) {
       document.documentElement.classList.add('dark');
@@ -113,6 +156,30 @@ export default function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [isDarkMode]);
+
+  // Persist settings & dark mode to localStorage on every change (NEVER store Spamhaus password)
+  useEffect(() => {
+    try {
+      const toStore = {
+        workers: settings.workers,
+        timeoutSeconds: settings.timeoutSeconds,
+        maxRetries: settings.maxRetries,
+        enableSSL: settings.enableSSL,
+        enableWebsite: settings.enableWebsite,
+        enableWhois: settings.enableWhois,
+        enableSpamhaus: settings.enableSpamhaus,
+        whoisPacedDelayMs: settings.whoisPacedDelayMs,
+        spamhausPacedDelayMs: settings.spamhausPacedDelayMs,
+        spamhausUseProxy: settings.spamhausUseProxy,
+        spamhausProxies: settings.spamhausProxies,
+        spamhausUsername: settings.spamhausUsername,
+        isDarkMode
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
+    } catch (err) {
+      console.warn('Failed to save settings to localStorage:', err);
+    }
+  }, [settings, isDarkMode]);
 
   // Client-side domain validation & normalization
   const validateInputDomains = useCallback((text: string) => {
@@ -154,10 +221,30 @@ export default function App() {
     validateInputDomains(domainText);
   }, [domainText, validateInputDomains]);
 
-  // Connect to backend Server-Sent Events (SSE) for live, real-time updates
+  // Connect to backend Server-Sent Events (SSE) for live, real-time updates and reset on startup (fresh start)
   useEffect(() => {
     let evtSource: EventSource | null = null;
     let pollInterval: NodeJS.Timeout | null = null;
+
+    // Refresh behavior: On app load, call POST /api/reset so previous server state is discarded
+    const initApp = async () => {
+      try {
+        const res = await fetch('/api/reset', { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.state) {
+            setState({
+              ...data.state,
+              settings
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Failed to reset on startup', err);
+      }
+    };
+
+    initApp();
 
     const connectSSE = () => {
       try {
@@ -206,7 +293,6 @@ export default function App() {
       } catch {}
     };
 
-    fetchStatus();
     connectSSE();
 
     return () => {
@@ -218,13 +304,38 @@ export default function App() {
   // Synchronize server credential awareness to local settings if detected
   useEffect(() => {
     if (state.settings?.hasSpamhausCreds !== undefined) {
-      setSettings((prev) => ({
-        ...prev,
-        hasSpamhausCreds: state.settings.hasSpamhausCreds,
-        enableSpamhaus: prev.enableSpamhaus ?? state.settings.enableSpamhaus ?? false
-      }));
+      setSettings((prev) => {
+        if (prev.hasSpamhausCreds === state.settings.hasSpamhausCreds) return prev;
+        return {
+          ...prev,
+          hasSpamhausCreds: state.settings.hasSpamhausCreds,
+          enableSpamhaus: prev.enableSpamhaus ?? state.settings.enableSpamhaus ?? false
+        };
+      });
     }
   }, [state.settings?.hasSpamhausCreds, state.settings?.enableSpamhaus]);
+
+  // Clear handler: empties domain textarea, clears all results, KPIs, progress, logs, filters, search
+  const handleClear = async () => {
+    try {
+      // 1. Reset client states
+      setDomainText('');
+      setActiveFilter('all');
+      setSearchQuery('');
+      setSelectedDetailItem(null);
+      setState({
+        ...DEFAULT_STATE,
+        settings
+      });
+
+      // 2. Call backend reset endpoint
+      await fetch('/api/reset', { method: 'POST' });
+      showToast('Cleared', 'info');
+    } catch (err) {
+      console.error('Failed to clear state', err);
+      showToast('Cleared', 'info');
+    }
+  };
 
   // Handlers
   const handleStart = async () => {
@@ -394,7 +505,7 @@ export default function App() {
               onChange={setDomainText}
               validation={validation}
               isChecking={isChecking}
-              onClear={() => setDomainText('')}
+              onClear={handleClear}
               onLoadSample={() => setDomainText(INITIAL_SAMPLE_DOMAINS)}
             />
 
@@ -508,6 +619,8 @@ export default function App() {
           items={state.items}
           activeFilter={activeFilter}
           onFilterChange={setActiveFilter}
+          searchQuery={searchQuery}
+          onSearchQueryChange={setSearchQuery}
           onViewDetails={(item) => setSelectedDetailItem(item)}
           onRecheck={handleRecheckItem}
           onRetryAllIssues={handleRetryAllIssues}
