@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { jobManager } from './server/jobManager.js';
 import { runFullTestSuite } from './server/testSuite.js';
+import { spamhausChecker } from './server/spamhausChecker.js';
 
 dotenv.config();
 
@@ -147,6 +148,25 @@ async function startServer() {
     );
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(buffer);
+  });
+
+  app.post('/api/spamhaus/test', async (req: Request, res: Response) => {
+    try {
+      const { username, password, proxies, useProxy } = req.body;
+      const result = await spamhausChecker.testConnection(
+        { username, password },
+        proxies,
+        useProxy
+      );
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err?.message || 'Connection test failed' });
+    }
+  });
+
+  app.post('/api/retry-spamhaus', (_req: Request, res: Response) => {
+    const state = jobManager.retrySpamhausErrors();
+    res.json({ success: true, state });
   });
 
   app.post('/api/test-suite/run', async (_req: Request, res: Response) => {

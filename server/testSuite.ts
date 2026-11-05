@@ -130,8 +130,14 @@ export async function runFullTestSuite(): Promise<{
       'repro-tech.co.uk'
     ];
 
-    const state = testManager.startJob(sampleInput);
-    const parsed = state.items.map((it) => it.domain);
+    const state = await testManager.startJob(sampleInput, {
+      workers: 3,
+      enableSSL: false,
+      enableWebsite: false,
+      enableWhois: false,
+      enableSpamhaus: false
+    });
+    const parsed = state.items.map((it: any) => it.domain);
 
     // Verify ordering
     const matchesOriginal =
@@ -140,7 +146,7 @@ export async function runFullTestSuite(): Promise<{
       parsed[1] === 'supporteasyjet.com' &&
       parsed[2] === 'repro-tech.co.uk';
 
-    const exportRows = testManager.getExportData();
+    const exportRows = await testManager.getExportData();
     const exportOrderMaintained =
       exportRows.length === 3 &&
       exportRows[0].Domain === 'carcrashkits.com' &&
@@ -162,18 +168,19 @@ export async function runFullTestSuite(): Promise<{
   {
     const start = Date.now();
     const testManager = new JobManager();
-    const state = testManager.startJob(['example.com'], {
+    const state = await testManager.startJob(['example.com'], {
       workers: 1,
       enableSSL: true,
       enableWebsite: true,
-      enableWhois: false
+      enableWhois: false,
+      enableSpamhaus: false
     });
 
     // Verify initial step is queued or starting with SSL
     const initialItem = state.items[0];
     const sequenceOk = initialItem && initialItem.originalIndex === 1;
 
-    testManager.stopJob();
+    await testManager.stopJob();
 
     record(
       'Execution',

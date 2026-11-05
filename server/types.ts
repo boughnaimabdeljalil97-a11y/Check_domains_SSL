@@ -1,8 +1,9 @@
 export type SSLStatus = 'YES' | 'NO' | 'UNKNOWN' | 'CHECKING';
 export type WebsiteStatus = 'YES' | 'NO' | 'UNKNOWN' | 'CHECKING';
 export type WhoisStatus = 'FOUND' | 'NOT_FOUND' | 'ERROR' | 'CHECKING' | 'SKIPPED';
+export type SpamhausStatus = 'pending' | 'running' | 'done' | 'not found' | 'error' | 'rate limited' | 'skipped';
 export type DomainJobStatus = 'pending' | 'checking' | 'completed' | 'paused' | 'failed' | 'retry_required';
-export type StepType = 'idle' | 'ssl' | 'website' | 'whois' | 'done';
+export type StepType = 'idle' | 'ssl' | 'website' | 'whois' | 'spamhaus' | 'done';
 
 export interface SSLResult {
   status: SSLStatus;
@@ -54,8 +55,24 @@ export interface WhoisResult {
   checkedAt?: string;
 }
 
+export interface SpamhausResult {
+  status: SpamhausStatus;
+  tags: string; // e.g. "snowshoe, botnet" or ""
+  clusters: string; // "auth, infra" | "auth" | "infra" | "NO"
+  clusterAuthId?: string | null;
+  clusterInfraId?: string | null;
+  abused?: boolean;
+  score?: number | null;
+  domain?: string;
+  lastSeen?: number | null;
+  rawJson?: any;
+  raw?: any;
+  error?: string | null;
+  checkedAt?: string;
+}
+
 export interface DomainLog {
-  step: 'system' | 'ssl' | 'website' | 'whois';
+  step: 'system' | 'ssl' | 'website' | 'whois' | 'spamhaus';
   timestamp: string;
   message: string;
   type: 'info' | 'success' | 'warn' | 'error';
@@ -72,6 +89,15 @@ export interface DomainItem {
   ssl: SSLResult;
   website: WebsiteResult;
   whois: WhoisResult;
+  spamhaus: SpamhausResult;
+  // Direct convenience fields
+  spamhausTags?: string;
+  spamhausClusters?: string;
+  spamhausClusterAuth?: string | null;
+  spamhausClusterInfra?: string | null;
+  spamhausAbused?: boolean;
+  spamhausScore?: number | null;
+  spamhausStatus?: SpamhausStatus;
   retries: number;
   maxRetries: number;
   logs: DomainLog[];
@@ -87,7 +113,14 @@ export interface CheckerSettings {
   enableSSL: boolean; // default true
   enableWebsite: boolean; // default true
   enableWhois: boolean; // default true
-  whoisPacedDelayMs?: number; // default 800ms pacing between registry WHOIS queries
+  enableSpamhaus: boolean; // default false (or true if creds)
+  whoisPacedDelayMs?: number; // default 800ms
+  spamhausUsername?: string;
+  spamhausPassword?: string;
+  spamhausUseProxy?: boolean;
+  spamhausProxies?: string[];
+  spamhausPacedDelayMs?: number; // default 1000ms
+  hasSpamhausCreds?: boolean; // sanitized boolean returned to UI
 }
 
 export interface InspectionStats {
@@ -102,6 +135,9 @@ export interface InspectionStats {
   websiteNo: number;
   bothYes: number;
   whoisFound: number;
+  clustersFound: number;
+  taggedCount: number;
+  spamhausErrors: number;
   percentComplete: number;
 }
 
@@ -115,3 +151,4 @@ export interface InspectionState {
   startedAt?: string | null;
   updatedAt: string;
 }
+

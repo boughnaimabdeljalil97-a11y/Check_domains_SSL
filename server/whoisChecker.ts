@@ -275,7 +275,7 @@ function parseWhoisText(raw: string, domain: string): WhoisResult {
     // Registration / Creation Date
     if (!registeredOn) {
       const match = trimmed.match(
-        /^(?:creation date|registration date|registered on|registered|created|domain created|entry created):\s*(.+)$/i
+        /^(?:creation date|registration date|registered on|registered|created|domain created|entry created|domain name commencement date|domain registered|date de creation):\s*(.+)$/i
       );
       if (match) {
         registeredOn = formatDate(match[1]);
@@ -285,7 +285,7 @@ function parseWhoisText(raw: string, domain: string): WhoisResult {
     // Updated Date
     if (!updatedOn) {
       const match = trimmed.match(
-        /^(?:updated date|last updated|last-modified|modified date|changed):\s*(.+)$/i
+        /^(?:updated date|last updated|last-modified|modified date|changed|derniere modification):\s*(.+)$/i
       );
       if (match) {
         updatedOn = formatDate(match[1]);
@@ -295,7 +295,7 @@ function parseWhoisText(raw: string, domain: string): WhoisResult {
     // Expiration Date
     if (!expiresOn) {
       const match = trimmed.match(
-        /^(?:registry expiry date|expiration date|expiry date|registrar registration expiration date|free-date|expires):\s*(.+)$/i
+        /^(?:registry expiry date|expiration date|expiry date|registrar registration expiration date|free-date|expires|date d'expiration|renewal date):\s*(.+)$/i
       );
       if (match) {
         expiresOn = formatDate(match[1]);
@@ -440,17 +440,17 @@ function parseRdapResponse(data: any, domain: string): WhoisResult {
 
   if (Array.isArray(data.events)) {
     for (const evt of data.events) {
-      const action = evt.eventAction;
+      const action = (evt.eventAction || '').toLowerCase().trim();
       const date = evt.eventDate;
       if (!date) continue;
 
       const formatted = formatDate(date);
-      if (action === 'registration') {
-        registeredOn = formatted;
-      } else if (action === 'last changed' || action === 'last update') {
-        updatedOn = formatted;
-      } else if (action === 'expiration') {
-        expiresOn = formatted;
+      if (action === 'registration' || action === 'created' || action === 'transfer') {
+        if (!registeredOn) registeredOn = formatted;
+      } else if (action === 'last changed' || action === 'last update' || action === 'last updated' || action === 'updated') {
+        if (!updatedOn) updatedOn = formatted;
+      } else if (action === 'expiration' || action === 'expired' || action === 'registry expiration') {
+        if (!expiresOn) expiresOn = formatted;
       }
     }
   }

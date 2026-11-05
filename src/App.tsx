@@ -1,4 +1,18 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  Activity,
+  Cpu,
+  Clock,
+  Layers,
+  ShieldCheck,
+  CheckCircle2,
+  AlertCircle,
+  Play,
+  Pause,
+  Square,
+  Settings,
+  X
+} from 'lucide-react';
 import { Header } from './components/Header';
 import { SummaryCards } from './components/SummaryCards';
 import { DomainInput } from './components/DomainInput';
@@ -25,7 +39,10 @@ const DEFAULT_SETTINGS: CheckerSettings = {
   maxRetries: 2,
   enableSSL: true,
   enableWebsite: true,
-  enableWhois: true
+  enableWhois: true,
+  enableSpamhaus: false,
+  spamhausUseProxy: false,
+  spamhausPacedDelayMs: 1000
 };
 
 const DEFAULT_STATE: InspectionState = {
@@ -44,6 +61,9 @@ const DEFAULT_STATE: InspectionState = {
     websiteNo: 0,
     bothYes: 0,
     whoisFound: 0,
+    clustersFound: 0,
+    taggedCount: 0,
+    spamhausErrors: 0,
     percentComplete: 0
   },
   activeWorkers: 0,
@@ -52,6 +72,12 @@ const DEFAULT_STATE: InspectionState = {
   updatedAt: new Date().toISOString()
 };
 
+interface Toast {
+  id: string;
+  type: 'success' | 'info' | 'error' | 'warn';
+  message: string;
+}
+
 export default function App() {
   const [domainText, setDomainText] = useState(INITIAL_SAMPLE_DOMAINS);
   const [settings, setSettings] = useState<CheckerSettings>(DEFAULT_SETTINGS);
@@ -59,6 +85,9 @@ export default function App() {
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [selectedDetailItem, setSelectedDetailItem] = useState<DomainItem | null>(null);
   const [isTestSuiteOpen, setIsTestSuiteOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const [validation, setValidation] = useState<ValidationSummary>({
     valid: [],
     invalid: [],
@@ -67,6 +96,23 @@ export default function App() {
     totalInvalid: 0,
     totalDuplicates: 0
   });
+
+  const showToast = useCallback((message: string, type: Toast['type'] = 'info') => {
+    const id = `${Date.now()}-${Math.random()}`;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4000);
+  }, []);
+
+  // Sync dark mode class on <html>
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [isDarkMode]);
 
   // Client-side domain validation & normalization
   const validateInputDomains = useCallback((text: string) => {
@@ -128,6 +174,10 @@ export default function App() {
                 const updated = data.state.items.find((it: DomainItem) => it.id === prev.id);
                 return updated || prev;
               });
+
+              if (data.event === 'job_completed') {
+                showToast(`Inspection completed for ${data.state.stats.total} domains`, 'success');
+              }
             }
           } catch (e) {
             console.error('Error parsing SSE event', e);
@@ -163,12 +213,24 @@ export default function App() {
       evtSource?.close();
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, []);
+  }, [showToast]);
+
+  // Synchronize server credential awareness to local settings if detected
+  useEffect(() => {
+    if (state.settings?.hasSpamhausCreds !== undefined) {
+      setSettings((prev) => ({
+        ...prev,
+        hasSpamhausCreds: state.settings.hasSpamhausCreds,
+        enableSpamhaus: prev.enableSpamhaus ?? state.settings.enableSpamhaus ?? false
+      }));
+    }
+  }, [state.settings?.hasSpamhausCreds, state.settings?.enableSpamhaus]);
 
   // Handlers
   const handleStart = async () => {
     if (validation.valid.length === 0) return;
     try {
+      showToast(`Starting inspection for ${validation.totalValid} domains...`, 'info');
       const res = await fetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -183,11 +245,13 @@ export default function App() {
       }
     } catch (err) {
       console.error('Failed to start inspection', err);
+      showToast('Failed to start inspection', 'error');
     }
   };
 
   const handlePause = async () => {
     try {
+      showToast('Pausing inspection workers...', 'info');
       const res = await fetch('/api/pause', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
@@ -200,6 +264,7 @@ export default function App() {
 
   const handleResume = async () => {
     try {
+      showToast('Resuming inspection workers...', 'info');
       const res = await fetch('/api/resume', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
@@ -212,6 +277,7 @@ export default function App() {
 
   const handleStop = async () => {
     try {
+      showToast('Inspection stopped', 'warn');
       const res = await fetch('/api/stop', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
@@ -224,6 +290,7 @@ export default function App() {
 
   const handleRecheckItem = async (item: DomainItem) => {
     try {
+      showToast(`Queued recheck for ${item.domain}`, 'info');
       const res = await fetch('/api/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -240,6 +307,7 @@ export default function App() {
 
   const handleRetryAllIssues = async () => {
     try {
+      showToast('Retrying all issue domains...', 'info');
       const res = await fetch('/api/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -256,6 +324,7 @@ export default function App() {
 
   const handleRecheckMissingDates = async () => {
     try {
+      showToast('Initiating paced RDAP registry recheck...', 'info');
       const res = await fetch('/api/recheck-missing-whois', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
@@ -266,19 +335,34 @@ export default function App() {
     }
   };
 
+  const handleRetrySpamhaus = async () => {
+    try {
+      showToast('Retrying Spamhaus error domains...', 'info');
+      const res = await fetch('/api/retry-spamhaus', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setState(data.state);
+      }
+    } catch (err) {
+      console.error('Failed to retry Spamhaus errors', err);
+    }
+  };
+
   const handleDownloadCsv = () => {
+    showToast('Downloading CSV report (order preserved)...', 'success');
     window.location.href = '/api/export/csv';
   };
 
   const handleDownloadExcel = () => {
+    showToast('Downloading Excel spreadsheet (order preserved)...', 'success');
     window.location.href = '/api/export/xlsx';
   };
 
   const isChecking = state.status === 'running';
 
   return (
-    <div className="min-h-screen bg-slate-50/60 text-slate-900 flex flex-col font-sans selection:bg-emerald-100 selection:text-emerald-900">
-      {/* 1. Header */}
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-900 transition-colors">
+      {/* 1. Top Header */}
       <Header
         state={state}
         onStart={handleStart}
@@ -287,24 +371,24 @@ export default function App() {
         onStop={handleStop}
         onOpenTestSuite={() => setIsTestSuiteOpen(true)}
         hasValidDomains={validation.totalValid > 0}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        isDarkMode={isDarkMode}
+        onToggleDarkMode={() => setIsDarkMode(!isDarkMode)}
       />
 
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* 2. Top Metric Cards */}
+        {/* 2. Responsive KPI Summary Cards */}
         <SummaryCards
           stats={state.stats}
           activeFilter={activeFilter}
           onSelectFilter={(f) => setActiveFilter(f)}
         />
 
-        {/* 3. Progress Track (visible when checks have started) */}
-        <ProgressBar state={state} />
-
-        {/* 4. Input & Settings Row */}
+        {/* 3. Main 12-Column Layout */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Domain Input Textarea */}
-          <div className="lg:col-span-7">
+          {/* Left Column (8 cols): Domain Input + Progress Track */}
+          <div className="lg:col-span-8 space-y-5">
             <DomainInput
               value={domainText}
               onChange={setDomainText}
@@ -313,19 +397,113 @@ export default function App() {
               onClear={() => setDomainText('')}
               onLoadSample={() => setDomainText(INITIAL_SAMPLE_DOMAINS)}
             />
+
+            <ProgressBar state={state} />
           </div>
 
-          {/* Engine Settings Panel */}
-          <div className="lg:col-span-5">
-            <SettingsPanel
-              settings={settings}
-              onChange={setSettings}
-              disabled={isChecking}
-            />
+          {/* Right Column (4 cols): Live Status & Engine Card */}
+          <div className="lg:col-span-4">
+            <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200/80 dark:border-slate-800 p-5 shadow-2xs space-y-4 h-full flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
+                  <div className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                      Live Engine Status
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsSettingsOpen(true)}
+                    className="p-1.5 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                    title="Open Settings Drawer"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Worker Pool Activity */}
+                <div className="mt-4 space-y-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-500 dark:text-slate-400 font-medium">Worker Allocation</span>
+                    <span className="font-mono font-bold text-slate-900 dark:text-white">
+                      {state.activeWorkers} / {settings.workers} Active
+                    </span>
+                  </div>
+
+                  <div className="w-full bg-slate-100 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-indigo-600 dark:bg-indigo-500 h-full rounded-full transition-all duration-300"
+                      style={{
+                        width: `${Math.round((state.activeWorkers / Math.max(settings.workers, 1)) * 100)}%`
+                      }}
+                    />
+                  </div>
+
+                  {/* Active Modules Checklist */}
+                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
+                    <span className="text-2xs font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 block">
+                      Active Modules
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 text-2xs">
+                      <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border ${
+                        settings.enableSSL
+                          ? 'bg-emerald-50/70 border-emerald-200/80 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-800 dark:text-emerald-300'
+                          : 'bg-slate-50 border-slate-200 text-slate-400 dark:bg-slate-800/40 dark:border-slate-800 dark:text-slate-500 opacity-60'
+                      }`}>
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span className="font-semibold">SSL Verification</span>
+                      </div>
+
+                      <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border ${
+                        settings.enableWebsite
+                          ? 'bg-blue-50/70 border-blue-200/80 text-blue-800 dark:bg-blue-950/40 dark:border-blue-800 dark:text-blue-300'
+                          : 'bg-slate-50 border-slate-200 text-slate-400 dark:bg-slate-800/40 dark:border-slate-800 dark:text-slate-500 opacity-60'
+                      }`}>
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span className="font-semibold">Website Check</span>
+                      </div>
+
+                      <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border ${
+                        settings.enableWhois
+                          ? 'bg-purple-50/70 border-purple-200/80 text-purple-800 dark:bg-purple-950/40 dark:border-purple-800 dark:text-purple-300'
+                          : 'bg-slate-50 border-slate-200 text-slate-400 dark:bg-slate-800/40 dark:border-slate-800 dark:text-slate-500 opacity-60'
+                      }`}>
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span className="font-semibold">WHOIS/RDAP</span>
+                      </div>
+
+                      <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border ${
+                        settings.enableSpamhaus
+                          ? 'bg-indigo-50/70 border-indigo-200/80 text-indigo-800 dark:bg-indigo-950/40 dark:border-indigo-800 dark:text-indigo-300'
+                          : 'bg-slate-50 border-slate-200 text-slate-400 dark:bg-slate-800/40 dark:border-slate-800 dark:text-slate-500 opacity-60'
+                      }`}>
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span className="font-semibold">Spamhaus SIA</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Bottom Quick Control */}
+              <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-2xs">
+                <span className="text-slate-500 dark:text-slate-400 font-mono">
+                  Timeout: {settings.timeoutSeconds}s · Retries: {settings.maxRetries}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="font-bold text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 dark:hover:text-indigo-300 transition-colors"
+                >
+                  Configure &rarr;
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
-        {/* 5. Results Table with Search & Exports */}
+        {/* 4. Results Table with Search & Exports */}
         <ResultsTable
           items={state.items}
           activeFilter={activeFilter}
@@ -333,6 +511,7 @@ export default function App() {
           onViewDetails={(item) => setSelectedDetailItem(item)}
           onRecheck={handleRecheckItem}
           onRetryAllIssues={handleRetryAllIssues}
+          onRetrySpamhaus={handleRetrySpamhaus}
           onRecheckMissingDates={handleRecheckMissingDates}
           onDownloadCsv={handleDownloadCsv}
           onDownloadExcel={handleDownloadExcel}
@@ -341,12 +520,23 @@ export default function App() {
       </main>
 
       {/* Footer */}
-      <footer className="bg-white border-t border-slate-200 mt-auto py-4 text-center text-xs text-slate-500">
+      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200/80 dark:border-slate-800 mt-auto py-4 text-center text-xs text-slate-500 dark:text-slate-400 transition-colors">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>Domain Inspector — Advanced SSL, Website & WHOIS Verification Engine</span>
-          <span className="font-mono text-2xs text-slate-400">Strict Independent Evaluation & Original Index Preservation</span>
+          <span>Domain Inspector — Advanced SSL, Availability, RDAP & Spamhaus Intel Engine</span>
+          <span className="font-mono text-2xs text-slate-400 dark:text-slate-500">
+            Strict Independent Pipeline · Original Index Order Preserved
+          </span>
         </div>
       </footer>
+
+      {/* Settings Slide-Over Drawer */}
+      <SettingsPanel
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        settings={settings}
+        onChange={setSettings}
+        disabled={isChecking}
+      />
 
       {/* Domain Details Modal */}
       <DetailModal
@@ -360,6 +550,41 @@ export default function App() {
         isOpen={isTestSuiteOpen}
         onClose={() => setIsTestSuiteOpen(false)}
       />
+
+      {/* Toast Notifications */}
+      {toasts.length > 0 && (
+        <div className="fixed bottom-5 right-5 z-50 space-y-2 max-w-sm w-full pointer-events-none">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className={`p-3.5 rounded-xl shadow-lg border text-xs font-semibold flex items-center justify-between pointer-events-auto animate-in slide-in-from-bottom duration-200 ${
+                t.type === 'success'
+                  ? 'bg-emerald-900 text-emerald-100 border-emerald-700'
+                  : t.type === 'error'
+                  ? 'bg-rose-900 text-rose-100 border-rose-700'
+                  : t.type === 'warn'
+                  ? 'bg-amber-900 text-amber-100 border-amber-700'
+                  : 'bg-slate-900 text-slate-100 border-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                {t.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
+                {t.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+                {t.type === 'warn' && <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />}
+                {t.type === 'info' && <ShieldCheck className="w-4 h-4 text-indigo-400 shrink-0" />}
+                <span>{t.message}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setToasts((prev) => prev.filter((item) => item.id !== t.id))}
+                className="text-white/60 hover:text-white p-0.5 ml-2"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

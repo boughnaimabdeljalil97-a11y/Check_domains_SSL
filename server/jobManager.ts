@@ -11,6 +11,7 @@ import type {
 import { checkDomainSSL } from './sslChecker.js';
 import { checkDomainWebsite } from './websiteChecker.js';
 import { checkDomainWhois } from './whoisChecker.js';
+import { spamhausChecker } from './spamhausChecker.js';
 
 export class JobManager extends EventEmitter {
   private items: Map<string, DomainItem> = new Map();
@@ -24,9 +25,15 @@ export class JobManager extends EventEmitter {
     maxRetries: 2,
     enableSSL: true,
     enableWebsite: true,
-    enableWhois: true
+    enableWhois: true,
+    enableSpamhaus: Boolean(process.env.SPAMHAUS_USERNAME && process.env.SPAMHAUS_PASSWORD),
+    whoisPacedDelayMs: 800,
+    spamhausPacedDelayMs: 1000,
+    spamhausUseProxy: false,
+    spamhausProxies: []
   };
   private isProcessing = false;
+
 
   constructor() {
     super();
@@ -44,10 +51,16 @@ export class JobManager extends EventEmitter {
       }
     }
 
+    const sanitizedSettings: CheckerSettings = {
+      ...this.settings,
+      spamhausPassword: this.settings.spamhausPassword ? '••••••••' : undefined,
+      hasSpamhausCreds: spamhausChecker.hasCredentials()
+    };
+
     return {
       status: this.stateStatus,
       items: itemsArray,
-      settings: { ...this.settings },
+      settings: sanitizedSettings,
       stats,
       activeWorkers: this.inFlightWorkers.size,
       currentWorkerAssignments: workerAssignments,
@@ -67,6 +80,9 @@ export class JobManager extends EventEmitter {
   public startJob(domains: string[] | string, customSettings?: Partial<CheckerSettings>): InspectionState {
     if (customSettings) {
       this.settings = { ...this.settings, ...customSettings };
+      if (customSettings.spamhausUsername || customSettings.spamhausPassword) {
+        spamhausChecker.setRuntimeCredentials(customSettings.spamhausUsername, customSettings.spamhausPassword);
+      }
     }
 
     // Clear previous state
@@ -115,6 +131,18 @@ export class JobManager extends EventEmitter {
           rawSummary: null,
           source: this.settings.enableWhois ? 'none' : 'skipped'
         },
+        spamhaus: {
+          status: this.settings.enableSpamhaus && spamhausChecker.hasCredentials() ? 'pending' : 'skipped',
+          tags: '',
+          clusters: '',
+          clusterAuthId: null,
+          clusterInfraId: null
+        },
+        spamhausTags: '',
+        spamhausClusters: '',
+        spamhausClusterAuth: null,
+        spamhausClusterInfra: null,
+        spamhausStatus: this.settings.enableSpamhaus && spamhausChecker.hasCredentials() ? 'pending' : 'skipped',
         retries: 0,
         maxRetries: this.settings.maxRetries,
         logs: [
@@ -186,6 +214,10 @@ export class JobManager extends EventEmitter {
     if (this.settings.enableSSL) item.ssl.status = 'CHECKING';
     if (this.settings.enableWebsite) item.website.status = 'CHECKING';
     if (this.settings.enableWhois) item.whois.status = 'CHECKING';
+    if (this.settings.enableSpamhaus) {
+      item.spamhaus.status = 'pending';
+      item.spamhausStatus = 'pending';
+    }
 
     this.queue.push(itemId);
     if (this.stateStatus !== 'running') {
@@ -202,7 +234,9 @@ export class JobManager extends EventEmitter {
         item.status === 'failed' ||
         item.status === 'retry_required' ||
         item.website.status === 'UNKNOWN' ||
-        item.ssl.status === 'UNKNOWN';
+        item.ssl.status === 'UNKNOWN' ||
+        item.spamhaus?.status === 'error' ||
+        item.spamhaus?.status === 'rate limited';
 
       if (isIssue && !this.queue.includes(item.id) && !Array.from(this.inFlightWorkers.values()).includes(item.id)) {
         item.status = 'pending';
@@ -217,6 +251,40 @@ export class JobManager extends EventEmitter {
         if (this.settings.enableSSL) item.ssl.status = 'CHECKING';
         if (this.settings.enableWebsite) item.website.status = 'CHECKING';
         if (this.settings.enableWhois) item.whois.status = 'CHECKING';
+        if (this.settings.enableSpamhaus) {
+          item.spamhaus.status = 'pending';
+          item.spamhausStatus = 'pending';
+        }
+        this.queue.push(item.id);
+      }
+    }
+
+    if (this.stateStatus !== 'running' && this.queue.length > 0) {
+      this.stateStatus = 'running';
+    }
+    this.emitStateChange('batch_retry_started');
+    this.scheduleWorkers();
+    return this.getFullState();
+  }
+
+  public retrySpamhausErrors(): InspectionState {
+    for (const item of this.items.values()) {
+      const isSpamhausIssue =
+        item.spamhaus?.status === 'error' ||
+        item.spamhaus?.status === 'rate limited';
+
+      if (isSpamhausIssue && !this.queue.includes(item.id) && !Array.from(this.inFlightWorkers.values()).includes(item.id)) {
+        item.status = 'pending';
+        item.currentStep = 'idle';
+        item.spamhaus.status = 'pending';
+        item.spamhausStatus = 'pending';
+        item.retries += 1;
+        item.logs.push({
+          step: 'spamhaus',
+          timestamp: new Date().toISOString(),
+          message: `Retry requested for Spamhaus error`,
+          type: 'info'
+        });
         this.queue.push(item.id);
       }
     }
@@ -346,126 +414,197 @@ export class JobManager extends EventEmitter {
   private async processDomainSequential(item: DomainItem, workerId: number): Promise<void> {
     const timeoutMs = this.settings.timeoutSeconds * 1000;
 
-    // STEP 1 & 2: SSL CHECK & SAVE
-    if (this.settings.enableSSL) {
-      item.currentStep = 'ssl';
-      this.log(item, 'ssl', `Worker #${workerId}: Starting TLS certificate check on port 443...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'ssl' });
+    try {
+      // STEP 1 & 2: SSL CHECK & SAVE
+      if (this.settings.enableSSL) {
+        item.currentStep = 'ssl';
+        this.log(item, 'ssl', `Worker #${workerId}: Starting TLS certificate check on port 443...`, 'info');
+        this.emitStateChange('step_started', { domainId: item.id, step: 'ssl' });
 
-      try {
-        const sslRes = await checkDomainSSL(item.cleanDomain, { timeoutMs: Math.min(timeoutMs, 15000) });
-        item.ssl = sslRes;
+        try {
+          const sslRes = await checkDomainSSL(item.cleanDomain, { timeoutMs: Math.min(timeoutMs, 15000) });
+          item.ssl = sslRes;
 
-        const logType = sslRes.status === 'YES' ? 'success' : 'warn';
-        this.log(item, 'ssl', `Worker #${workerId}: SSL Check completed: ${sslRes.status} (${sslRes.reason})`, logType);
-      } catch (sslErr: any) {
-        item.ssl = {
-          status: 'NO',
-          valid: false,
-          reason: `SSL check exception: ${sslErr.message}`,
-          checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'ssl', `Worker #${workerId}: SSL Check error: ${sslErr.message}`, 'error');
+          const logType = sslRes.status === 'YES' ? 'success' : 'warn';
+          this.log(item, 'ssl', `Worker #${workerId}: SSL Check completed: ${sslRes.status} (${sslRes.reason})`, logType);
+        } catch (sslErr: any) {
+          item.ssl = {
+            status: 'NO',
+            valid: false,
+            reason: `SSL check exception: ${sslErr.message}`,
+            checkedAt: new Date().toISOString()
+          };
+          this.log(item, 'ssl', `Worker #${workerId}: SSL Check error: ${sslErr.message}`, 'error');
+        }
+
+        this.emitStateChange('step_completed', { domainId: item.id, step: 'ssl' });
       }
 
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'ssl' });
-    }
+      // Check pause/stop between steps
+      if (this.isStopped()) return;
 
-    // Check pause/stop between steps
-    if (this.isStopped()) return;
+      // STEP 3 & 4: WEBSITE CHECK & SAVE
+      if (this.settings.enableWebsite) {
+        item.currentStep = 'website';
+        this.log(item, 'website', `Worker #${workerId}: Starting Website availability inspection...`, 'info');
+        this.emitStateChange('step_started', { domainId: item.id, step: 'website' });
 
-    // STEP 3 & 4: WEBSITE CHECK & SAVE
-    if (this.settings.enableWebsite) {
-      item.currentStep = 'website';
-      this.log(item, 'website', `Worker #${workerId}: Starting Website availability inspection...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'website' });
+        try {
+          const webRes = await checkDomainWebsite(item.cleanDomain, { timeoutMs });
+          item.website = webRes;
 
-      try {
-        const webRes = await checkDomainWebsite(item.cleanDomain, { timeoutMs });
-        item.website = webRes;
+          const logType = webRes.status === 'YES' ? 'success' : webRes.status === 'UNKNOWN' ? 'warn' : 'error';
+          this.log(item, 'website', `Worker #${workerId}: Website Check completed: ${webRes.status} (${webRes.reason})`, logType);
+        } catch (webErr: any) {
+          item.website = {
+            status: 'UNKNOWN',
+            available: false,
+            reason: `Website check exception: ${webErr.message}`,
+            statusCode: null,
+            finalUrl: `http://${item.cleanDomain}`,
+            title: '',
+            redirects: [],
+            loadTimeMs: 0,
+            detectedExclusionType: 'other',
+            checkedAt: new Date().toISOString()
+          };
+          this.log(item, 'website', `Worker #${workerId}: Website Check error: ${webErr.message}`, 'error');
+        }
 
-        const logType = webRes.status === 'YES' ? 'success' : webRes.status === 'UNKNOWN' ? 'warn' : 'error';
-        this.log(item, 'website', `Worker #${workerId}: Website Check completed: ${webRes.status} (${webRes.reason})`, logType);
-      } catch (webErr: any) {
-        item.website = {
-          status: 'UNKNOWN',
-          available: false,
-          reason: `Website check exception: ${webErr.message}`,
-          statusCode: null,
-          finalUrl: `http://${item.cleanDomain}`,
-          title: '',
-          redirects: [],
-          loadTimeMs: 0,
-          detectedExclusionType: 'other',
-          checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'website', `Worker #${workerId}: Website Check error: ${webErr.message}`, 'error');
+        this.emitStateChange('step_completed', { domainId: item.id, step: 'website' });
       }
 
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'website' });
-    }
+      // Check pause/stop between steps
+      if (this.isStopped()) return;
 
-    // Check pause/stop between steps
-    if (this.isStopped()) return;
+      // STEP 5 & 6: WHOIS / RDAP LOOKUP & SAVE
+      if (this.settings.enableWhois) {
+        item.currentStep = 'whois';
+        this.log(item, 'whois', `Worker #${workerId}: Querying RDAP registration data...`, 'info');
+        this.emitStateChange('step_started', { domainId: item.id, step: 'whois' });
 
-    // STEP 5 & 6: WHOIS / RDAP LOOKUP & SAVE
-    if (this.settings.enableWhois) {
-      item.currentStep = 'whois';
-      this.log(item, 'whois', `Worker #${workerId}: Querying RDAP registration data...`, 'info');
-      this.emitStateChange('step_started', { domainId: item.id, step: 'whois' });
+        try {
+          const whoisRes = await checkDomainWhois(item.cleanDomain, {
+            timeoutMs: 12000,
+            pacedDelayMs: this.settings.whoisPacedDelayMs || 800,
+            maxAttempts: 3,
+            onRetry: (attempt, msg) => {
+              this.log(item, 'whois', `Worker #${workerId} (Attempt ${attempt}): ${msg}`, 'info');
+              this.emitStateChange('item_updated', item);
+            }
+          });
+          item.whois = whoisRes;
 
-      try {
-        const whoisRes = await checkDomainWhois(item.cleanDomain, {
-          timeoutMs: 12000,
-          pacedDelayMs: this.settings.whoisPacedDelayMs || 800,
-          maxAttempts: 3,
-          onRetry: (attempt, msg) => {
-            this.log(item, 'whois', `Worker #${workerId} (Attempt ${attempt}): ${msg}`, 'info');
-            this.emitStateChange('item_updated', item);
-          }
-        });
-        item.whois = whoisRes;
+          const logType = whoisRes.status === 'FOUND' && whoisRes.registeredOn ? 'success' : 'info';
+          this.log(
+            item,
+            'whois',
+            `Worker #${workerId}: Registration info: ${whoisRes.status} (${whoisRes.registrar || 'No registrar'} | ${whoisRes.registeredOn || 'Unavailable'})`,
+            logType
+          );
+        } catch (whoisErr: any) {
+          item.whois = {
+            status: 'NOT_FOUND',
+            registeredOn: null,
+            updatedOn: null,
+            expiresOn: null,
+            registrar: null,
+            domainStatus: [],
+            nameservers: [],
+            rawSummary: `WHOIS lookup error: ${whoisErr.message}`,
+            source: 'none',
+            checkedAt: new Date().toISOString()
+          };
+          this.log(item, 'whois', `Worker #${workerId}: Registration check error: ${whoisErr.message}`, 'warn');
+        }
 
-        const logType = whoisRes.status === 'FOUND' && whoisRes.registeredOn ? 'success' : 'info';
-        this.log(
-          item,
-          'whois',
-          `Worker #${workerId}: Registration info: ${whoisRes.status} (${whoisRes.registrar || 'No registrar'} | ${whoisRes.registeredOn || 'Unavailable'})`,
-          logType
-        );
-      } catch (whoisErr: any) {
-        item.whois = {
-          status: 'NOT_FOUND',
-          registeredOn: null,
-          updatedOn: null,
-          expiresOn: null,
-          registrar: null,
-          domainStatus: [],
-          nameservers: [],
-          rawSummary: `WHOIS lookup error: ${whoisErr.message}`,
-          source: 'none',
-          checkedAt: new Date().toISOString()
-        };
-        this.log(item, 'whois', `Worker #${workerId}: Registration check error: ${whoisErr.message}`, 'warn');
+        this.emitStateChange('step_completed', { domainId: item.id, step: 'whois' });
       }
 
-      this.emitStateChange('step_completed', { domainId: item.id, step: 'whois' });
+      // Check pause/stop between steps
+      if (this.isStopped()) return;
+
+      // STEP 7 & 8: SPAMHAUS INTELLIGENCE API (SIA) CHECK
+      const hasCreds = spamhausChecker.hasCredentials();
+      if (!this.settings.enableSpamhaus || !hasCreds) {
+        // Skip Spamhaus step entirely when disabled or credentials missing
+        item.spamhaus = {
+          status: 'skipped',
+          tags: '',
+          clusters: '',
+          clusterAuthId: null,
+          clusterInfraId: null
+        };
+        item.spamhausTags = '';
+        item.spamhausClusters = '';
+        item.spamhausClusterAuth = null;
+        item.spamhausClusterInfra = null;
+        item.spamhausStatus = 'skipped';
+      } else {
+        item.currentStep = 'spamhaus';
+        item.spamhaus.status = 'running';
+        item.spamhausStatus = 'running';
+        console.log(`[Spamhaus] [${item.cleanDomain}] Step started by worker #${workerId}`);
+        this.log(item, 'spamhaus', `Worker #${workerId}: Querying Spamhaus Intelligence API...`, 'info');
+        this.emitStateChange('step_started', { domainId: item.id, step: 'spamhaus' });
+
+        try {
+          const shRes = await spamhausChecker.checkDomain(item.cleanDomain, {
+            timeoutMs: 15000,
+            useProxy: this.settings.spamhausUseProxy,
+            proxies: this.settings.spamhausProxies,
+            pacedDelayMs: this.settings.spamhausPacedDelayMs || 1000
+          });
+
+          item.spamhaus = shRes;
+          item.spamhausTags = shRes.tags;
+          item.spamhausClusters = shRes.clusters;
+          item.spamhausClusterAuth = shRes.clusterAuthId;
+          item.spamhausClusterInfra = shRes.clusterInfraId;
+          item.spamhausAbused = shRes.abused;
+          item.spamhausScore = shRes.score;
+          item.spamhausStatus = shRes.status;
+
+          console.log(`[Spamhaus] [${item.cleanDomain}] Step completed: ${shRes.status}`);
+          const logType = shRes.status === 'done' ? 'success' : shRes.status === 'not found' ? 'info' : 'warn';
+          this.log(
+            item,
+            'spamhaus',
+            `Worker #${workerId}: Spamhaus result: ${shRes.status} (Tags: ${shRes.tags || 'none'}, Clusters: ${shRes.clusters})`,
+            logType
+          );
+        } catch (shErr: any) {
+          console.error(`[Spamhaus] [${item.cleanDomain}] Step error: ${shErr.message}`);
+          item.spamhaus = {
+            status: 'error',
+            tags: '',
+            clusters: 'NO',
+            clusterAuthId: null,
+            clusterInfraId: null,
+            error: shErr.message,
+            checkedAt: new Date().toISOString()
+          };
+          item.spamhausStatus = 'error';
+          this.log(item, 'spamhaus', `Worker #${workerId}: Spamhaus check error: ${shErr.message}`, 'error');
+        }
+
+        this.emitStateChange('step_completed', { domainId: item.id, step: 'spamhaus' });
+      }
+    } finally {
+      // STEP 9: MARK DOMAIN AS COMPLETED (always executed in finally block so worker is released)
+      item.currentStep = 'done';
+      item.completedAt = new Date().toISOString();
+
+      if (item.website.status === 'UNKNOWN' && item.retries < item.maxRetries) {
+        item.status = 'retry_required';
+        this.log(item, 'system', `Domain marked as Retry Required (${item.website.reason})`, 'warn');
+      } else if (item.status === 'checking' || item.status === 'pending') {
+        item.status = 'completed';
+        this.log(item, 'system', `All inspection steps completed successfully`, 'success');
+      }
+
+      this.emitStateChange('item_completed', item);
     }
-
-    // STEP 7: MARK DOMAIN AS COMPLETED OR RETRY REQUIRED
-    item.currentStep = 'done';
-    item.completedAt = new Date().toISOString();
-
-    // If website status is UNKNOWN (e.g. temporary challenge or timeout) and retries remain, mark retry_required
-    if (item.website.status === 'UNKNOWN' && item.retries < item.maxRetries) {
-      item.status = 'retry_required';
-      this.log(item, 'system', `Domain marked as Retry Required (${item.website.reason})`, 'warn');
-    } else {
-      item.status = 'completed';
-      this.log(item, 'system', `All inspection steps completed successfully`, 'success');
-    }
-
-    this.emitStateChange('item_completed', item);
   }
 
   private log(item: DomainItem, step: DomainLog['step'], message: string, type: DomainLog['type']) {
@@ -552,6 +691,9 @@ export class JobManager extends EventEmitter {
     let websiteNo = 0;
     let bothYes = 0;
     let whoisFound = 0;
+    let clustersFound = 0;
+    let taggedCount = 0;
+    let spamhausErrors = 0;
 
     for (const it of items) {
       if (it.status === 'completed') completed++;
@@ -567,6 +709,16 @@ export class JobManager extends EventEmitter {
 
       if (it.ssl.status === 'YES' && it.website.status === 'YES') bothYes++;
       if (it.whois.status === 'FOUND') whoisFound++;
+
+      const clusterVal = it.spamhausClusters || it.spamhaus?.clusters;
+      if (clusterVal && clusterVal !== 'NO') clustersFound++;
+
+      const tagsVal = it.spamhausTags || it.spamhaus?.tags;
+      if (tagsVal && tagsVal.trim().length > 0) taggedCount++;
+
+      if (it.spamhaus?.status === 'error' || it.spamhaus?.status === 'rate limited') {
+        spamhausErrors++;
+      }
     }
 
     const total = items.length;
@@ -584,6 +736,9 @@ export class JobManager extends EventEmitter {
       websiteNo,
       bothYes,
       whoisFound,
+      clustersFound,
+      taggedCount,
+      spamhausErrors,
       percentComplete
     };
   }
@@ -601,6 +756,8 @@ export class JobManager extends EventEmitter {
     return items.map((item) => ({
       '#': item.originalIndex,
       'Domain': item.domain,
+      'Tags': item.spamhausTags || item.spamhaus?.tags || '',
+      'Clusters': item.spamhausClusters || item.spamhaus?.clusters || 'NO',
       'Registered On': item.whois.registeredOn || 'N/A',
       'Updated On': item.whois.updatedOn || 'N/A',
       'Expires On': item.whois.expiresOn || 'N/A',
@@ -622,7 +779,7 @@ export class JobManager extends EventEmitter {
   public exportToCsv(): string {
     const data = this.getExportData();
     if (data.length === 0) {
-      return '#,Domain,Registered On,Updated On,Expires On,Registrar,SSL,SSL Reason,SSL Issuer,SSL Expiry,Days Until Expiry,Website,Website Reason,Final URL,HTTP Status,Load Time (ms),Completed At\n';
+      return '#,Domain,Tags,Clusters,Registered On,Updated On,Expires On,Registrar,SSL,SSL Reason,SSL Issuer,SSL Expiry,Days Until Expiry,Website,Website Reason,Final URL,HTTP Status,Load Time (ms),Completed At\n';
     }
 
     const headers = Object.keys(data[0]);
@@ -646,6 +803,8 @@ export class JobManager extends EventEmitter {
     const colWidths = [
       { wch: 4 },  // #
       { wch: 25 }, // Domain
+      { wch: 18 }, // Tags
+      { wch: 14 }, // Clusters
       { wch: 14 }, // Registered On
       { wch: 14 }, // Updated On
       { wch: 14 }, // Expires On
