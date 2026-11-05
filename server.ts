@@ -34,6 +34,11 @@ async function startServer() {
     }
   });
 
+  // Health check
+  app.get('/api/health', (_req: Request, res: Response) => {
+    res.json({ ok: true });
+  });
+
   // API Routes
   app.get('/api/status', (_req: Request, res: Response) => {
     res.json(jobManager.getFullState());
@@ -152,15 +157,24 @@ async function startServer() {
 
   app.post('/api/spamhaus/test', async (req: Request, res: Response) => {
     try {
-      const { username, password, proxies, useProxy } = req.body;
+      const { username, password, proxies, useProxy } = req.body || {};
       const result = await spamhausChecker.testConnection(
         { username, password },
         proxies,
         useProxy
       );
-      res.json(result);
+      res.json({
+        ok: result.success,
+        success: result.success,
+        message: result.message,
+        limits: result.limits
+      });
     } catch (err: any) {
-      res.status(500).json({ success: false, message: err?.message || 'Connection test failed' });
+      res.status(200).json({
+        ok: false,
+        success: false,
+        message: err?.message || 'Connection test failed'
+      });
     }
   });
 
@@ -178,7 +192,12 @@ async function startServer() {
     }
   });
 
-  // Frontend integration: Vite middleware in development, static in production
+  // Catch-all for unknown /api/* routes returning JSON (never fallback to HTML/SPA)
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'API route not found' });
+  });
+
+  // Frontend integration: Vite middleware in development, static in production (non-/api paths only)
   if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },

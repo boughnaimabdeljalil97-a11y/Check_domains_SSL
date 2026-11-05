@@ -59,16 +59,33 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     try {
       const res = await fetch('/api/spamhaus/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
         body: JSON.stringify({
-          username: settings.spamhausUsername,
-          password: settings.spamhausPassword,
+          username: settings.spamhausUsername?.trim() || undefined,
+          password: settings.spamhausPassword || undefined,
           useProxy: settings.spamhausUseProxy,
           proxies: settings.spamhausProxies
         })
       });
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        setTestResult({
+          success: false,
+          message: `Server returned non-JSON response (status ${res.status})`
+        });
+        return;
+      }
+
       const data = await res.json();
-      setTestResult(data);
+      setTestResult({
+        success: Boolean(data.ok ?? data.success),
+        message: data.message || (data.ok || data.success ? 'Connected successfully' : 'Connection failed'),
+        limits: data.limits
+      });
     } catch (err: any) {
       setTestResult({
         success: false,
