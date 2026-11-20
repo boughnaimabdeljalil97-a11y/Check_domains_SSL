@@ -15,8 +15,14 @@ const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
+  // Render and external hosts provide PORT (e.g. 10000 or 8080 in production).
+  // In development environments with an internal reverse-proxy (nginx on 8080), bind to 3000 / DEFAULT_APP_PORT.
+  const PORT = isProd && process.env.PORT
+    ? parseInt(process.env.PORT, 10)
+    : process.env.DEFAULT_APP_PORT
+    ? parseInt(process.env.DEFAULT_APP_PORT, 10)
+    : 3000;
 
   app.use(express.json({ limit: '10mb' }));
 

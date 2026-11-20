@@ -1,5 +1,5 @@
 import { checkDomainSSL } from './sslChecker.js';
-import { checkDomainWebsite } from './websiteChecker.js';
+import { checkDomainWebsite, classifyWebsiteContent } from './websiteChecker.js';
 import { JobManager } from './jobManager.js';
 
 export interface TestResultItem {
@@ -35,33 +35,129 @@ export async function runFullTestSuite(): Promise<{
     });
   };
 
-  // 1. WEBSITE TEST: CASE 1 — 404 "Sorry! That page cannot be found…"
+  // 1. WEBSITE TEST: (a) 200 page with big "404" + "Sorry! That page cannot be found... No brand config for domain(abc)" -> NO
   {
     const start = Date.now();
-    // Simulate classification logic on exact 404 string requirement
     const testHtml = `
       <!DOCTYPE html>
       <html>
         <head><title>404 - Not Found</title></head>
         <body>
           <div class="error-container">
-            <h1>404</h1>
-            <p>Sorry! That page cannot be found…</p>
+            <h1 class="font-large error">404</h1>
+            <p>Sorry! That page cannot be found... No brand config for domain(abc)</p>
           </div>
         </body>
       </html>
     `;
-    const has404 = testHtml.toLowerCase().includes('404');
-    const hasPhrase = testHtml.toLowerCase().includes('sorry! that page cannot be found');
-    const correctlyExcluded = has404 && hasPhrase;
+    const res = classifyWebsiteContent(testHtml, 200, 'https://example.com');
+    const passed = res.status === 'NO' && res.score >= 3;
 
     record(
       'Website',
-      'Case 1: 404 "Sorry! That page cannot be found…" exclusion rule',
-      correctlyExcluded,
-      correctlyExcluded
-        ? 'Successfully identified explicit 404 + "Sorry! That page cannot be found…" pattern -> Classified as Website = NO'
-        : 'Failed to detect 404 pattern',
+      'Test (a): HTTP 200 with 404 + "Sorry! That page cannot be found... No brand config" -> NO',
+      passed,
+      passed
+        ? `Correctly flagged dead page: status = ${res.status}, score = ${res.score} (Rules: ${res.matchedRules.join(', ')})`
+        : `Failed: expected NO with score >= 3, got status ${res.status} with score ${res.score}`,
+      Date.now() - start
+    );
+  }
+
+  // 2. WEBSITE TEST: (b) Different-worded 404 ("Oops, this page doesn't exist") -> NO
+  {
+    const start = Date.now();
+    const testHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head><title>Page Unavailable</title></head>
+        <body>
+          <div class="main-wrapper">
+            <h2>Oops, this page doesn't exist</h2>
+            <p>The URL you entered might be broken or mistyped.</p>
+          </div>
+        </body>
+      </html>
+    `;
+    const res = classifyWebsiteContent(testHtml, 200, 'https://sub.domain.org');
+    const passed = res.status === 'NO' && res.score >= 3;
+
+    record(
+      'Website',
+      'Test (b): Generic differently-worded 404 ("Oops, this page doesn\'t exist") -> NO',
+      passed,
+      passed
+        ? `Correctly flagged generic dead page: status = ${res.status}, score = ${res.score} (Rules: ${res.matchedRules.join(', ')})`
+        : `Failed: expected NO with score >= 3, got status ${res.status} with score ${res.score}`,
+      Date.now() - start
+    );
+  }
+
+  // 3. WEBSITE TEST: (c) Expired / parked page -> NO
+  {
+    const start = Date.now();
+    const testHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head><title>Domain For Sale | Make an Offer</title></head>
+        <body>
+          <div class="parking-banner">
+            <h1>Buy this domain</h1>
+            <p>This domain is parked. Renew or buy this domain today on sedoparking.</p>
+          </div>
+        </body>
+      </html>
+    `;
+    const res = classifyWebsiteContent(testHtml, 200, 'https://sedoparking.com/search');
+    const passed = res.status === 'NO' && res.score >= 3;
+
+    record(
+      'Website',
+      'Test (c): Expired or parked page (For sale / parking / renewal) -> NO',
+      passed,
+      passed
+        ? `Correctly flagged parked/expired page: status = ${res.status}, score = ${res.score} (Rules: ${res.matchedRules.join(', ')})`
+        : `Failed: expected NO with score >= 3, got status ${res.status} with score ${res.score}`,
+      Date.now() - start
+    );
+  }
+
+  // 4. WEBSITE TEST: (d) Normal content page -> YES
+  {
+    const start = Date.now();
+    const testHtml = `
+      <!DOCTYPE html>
+      <html lang="en">
+        <head>
+          <title>Acme Software Solutions - Cloud & DevOps Services</title>
+          <meta name="description" content="Enterprise cloud management and modern web applications" />
+        </head>
+        <body>
+          <nav>
+            <a href="/">Home</a>
+            <a href="/products">Products</a>
+            <a href="/pricing">Pricing</a>
+            <a href="/contact">Contact</a>
+          </nav>
+          <main>
+            <h1>Modern Cloud Engineering</h1>
+            <p>We deliver mission-critical software and cloud infrastructure for hyper-growth companies worldwide with seamless reliability and 24/7 technical support.</p>
+            <p>Explore our cutting-edge serverless integrations, real-time analytics dashboards, and multi-tenant security architecture designed for developers.</p>
+          </main>
+          <footer>&copy; 2026 Acme Corp. All rights reserved.</footer>
+        </body>
+      </html>
+    `;
+    const res = classifyWebsiteContent(testHtml, 200, 'https://acme-software.com');
+    const passed = res.status === 'YES' && res.score < 3;
+
+    record(
+      'Website',
+      'Test (d): Normal active content page -> YES',
+      passed,
+      passed
+        ? `Correctly recognized active website: status = ${res.status}, score = ${res.score} (Reason: ${res.reason})`
+        : `Failed: expected YES with score < 3, got status ${res.status} with score ${res.score}`,
       Date.now() - start
     );
   }

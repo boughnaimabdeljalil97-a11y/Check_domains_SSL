@@ -28,6 +28,14 @@ export interface SSLResult {
   };
 }
 
+export type WebsiteDetectionMethod =
+  | 'ok'
+  | 'http_error'
+  | 'empty_body'
+  | 'error_keyword'
+  | 'suspicious_title'
+  | 'title_mismatch';
+
 export interface WebsiteResult {
   status: WebsiteStatus;
   available: boolean;
@@ -39,7 +47,10 @@ export interface WebsiteResult {
   loadTimeMs: number;
   checkedAt?: string;
   detectedExclusionType?: 'none' | '404_not_found' | 'namecheap_expired' | 'bot_challenge' | 'dns_permanent_fail' | 'other';
+  detectionMethod?: WebsiteDetectionMethod;
   headers?: Record<string, string>;
+  websiteScore?: number;
+  websiteBodySnippet?: string;
 }
 
 export interface WhoisResult {

@@ -407,6 +407,31 @@ export const DetailModal: React.FC<DetailModalProps> = ({ item, onClose, onReche
                     {item.website.title || '(No title tag found)'}
                   </p>
                 </div>
+
+                {item.website.websiteScore !== undefined && (
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 sm:col-span-2">
+                    <span className="text-2xs font-semibold text-slate-400 uppercase">Dead Page Score</span>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className={`font-mono font-bold text-sm ${
+                        item.website.websiteScore >= 3 ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'
+                      }`}>
+                        {item.website.websiteScore}
+                      </span>
+                      <span className="text-2xs text-slate-500 dark:text-slate-400">
+                        ({item.website.websiteScore >= 3 ? 'Score >= 3: Dead/Inactive/Parked Page' : 'Score < 3: Active Website'})
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {item.website.websiteBodySnippet && (
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 sm:col-span-2">
+                    <span className="text-2xs font-semibold text-slate-400 uppercase">Content Snippet</span>
+                    <p className="font-mono text-2xs text-slate-600 dark:text-slate-300 mt-1 p-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg max-h-24 overflow-y-auto whitespace-pre-wrap">
+                      {item.website.websiteBodySnippet}
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
